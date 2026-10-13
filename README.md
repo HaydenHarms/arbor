@@ -24,6 +24,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, float
 - Near either end of an edge, it stacks instead: top or bottom of the right edge puts it above or below what's docked on the right, and the ends of the top or bottom edge put it beside what's docked there.
 - Drop it near the edge of a docked window to split that window's space.
 - Drop it in the middle of the screen or of any window and it floats. Drop a docked window there to float it again.
+- Maximized windows drag too: grab the title bar and the window restores under the pointer, as it does with Windows Snap on.
 - Drag the border between two docked windows to resize both at once.
 - Minimize a docked window and its neighbours take the space. Restore it and it comes back to the same spot.
 

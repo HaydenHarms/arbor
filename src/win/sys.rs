@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    GetLastError, BOOL, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
@@ -20,7 +20,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+    GetAsyncKeyState, RegisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_LBUTTON,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -35,6 +35,8 @@ pub use wm::{
     WM_RBUTTONUP, WM_TIMER,
 };
 pub const WM_TRAY: u32 = wm::WM_APP + 1;
+/// Posted to ourselves to take over dragging a maximized window.
+pub const WM_RESTORE_DRAG: u32 = wm::WM_APP + 2;
 
 pub const VK_SPACE: u32 = 0x20;
 pub const VK_RETURN: u32 = 0x0D;
@@ -176,6 +178,114 @@ pub fn install_event_hooks(f: EventFn) {
         unsafe {
             SetWinEventHook(lo, hi, None, Some(raw_event), 0, 0, flags);
         }
+    }
+}
+
+/// Mouse buttons and moves seen by the low-level mouse hook.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseEvent {
+    LeftDown,
+    LeftUp,
+    Move,
+}
+
+type MouseFn = fn(MouseEvent, (i32, i32));
+static MOUSE_FN: Mutex<Option<MouseFn>> = Mutex::new(None);
+
+unsafe extern "system" fn raw_mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let ev = match wp.0 as u32 {
+            wm::WM_LBUTTONDOWN => Some(MouseEvent::LeftDown),
+            wm::WM_LBUTTONUP => Some(MouseEvent::LeftUp),
+            wm::WM_MOUSEMOVE => Some(MouseEvent::Move),
+            _ => None,
+        };
+        let f = *MOUSE_FN.lock().unwrap();
+        if let (Some(ev), Some(f)) = (ev, f) {
+            let info = &*(lp.0 as *const wm::MSLLHOOKSTRUCT);
+            f(ev, (info.pt.x, info.pt.y));
+        }
+    }
+    wm::CallNextHookEx(None, code, wp, lp)
+}
+
+/// Watch the mouse system-wide. `f` must return quickly: Windows skips
+/// hooks that hold up input.
+pub fn install_mouse_hook(f: MouseFn) {
+    *MOUSE_FN.lock().unwrap() = Some(f);
+    unsafe {
+        let inst = GetModuleHandleW(None).unwrap_or_default();
+        let _ = wm::SetWindowsHookExW(wm::WH_MOUSE_LL, Some(raw_mouse), inst, 0);
+    }
+}
+
+pub fn post_to_self(h: Hwnd, msg: u32) {
+    unsafe {
+        let _ = wm::PostMessageW(hwnd(h), msg, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Whether Windows Snap is on. With it on, Windows itself lets you drag
+/// maximized windows; with it off, it doesn't.
+pub fn snap_enabled() -> bool {
+    let mut on = BOOL(0);
+    unsafe {
+        let _ = wm::SystemParametersInfoW(
+            wm::SPI_GETWINARRANGING,
+            0,
+            Some(&mut on as *mut BOOL as *mut c_void),
+            wm::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    on.as_bool()
+}
+
+pub fn is_maximized(h: Hwnd) -> bool {
+    unsafe { wm::IsZoomed(hwnd(h)).as_bool() }
+}
+
+pub fn left_button_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0 }
+}
+
+/// Whether (x, y) is on the window's title bar, by asking the window.
+/// Gives up (false) if it doesn't answer quickly.
+pub fn on_title_bar(h: Hwnd, (x, y): (i32, i32)) -> bool {
+    let mut hit = 0usize;
+    let lp = LPARAM(((y as u16 as isize) << 16) | x as u16 as isize);
+    unsafe {
+        wm::SendMessageTimeoutW(hwnd(h), wm::WM_NCHITTEST, WPARAM(0), lp, wm::SMTO_ABORTIFHUNG, 100, Some(&mut hit));
+    }
+    hit == wm::HTCAPTION as usize
+}
+
+/// Do what Windows does when you drag a maximized window with Snap on:
+/// restore it to its normal size under the pointer, keeping the grabbed
+/// spot on the title bar under it, and carry on the drag as a move.
+pub fn restore_and_drag(h: Hwnd, grab: (i32, i32), pointer: (i32, i32)) {
+    let Some(max) = visual_rect(h) else { return };
+    unsafe {
+        let mut wp = wm::WINDOWPLACEMENT { length: std::mem::size_of::<wm::WINDOWPLACEMENT>() as u32, ..Default::default() };
+        if wm::GetWindowPlacement(hwnd(h), &mut wp).is_err() {
+            return;
+        }
+        let n = to_rect(wp.rcNormalPosition);
+        let along = (grab.0 - max.x) as f32 / max.w.max(1) as f32;
+        let x = pointer.0 - (along * n.w as f32) as i32;
+        let y = pointer.1 - (grab.1 - max.y);
+        let _ = wm::ShowWindowAsync(hwnd(h), wm::SW_RESTORE);
+        let _ = wm::SetWindowPos(
+            hwnd(h),
+            None,
+            x,
+            y,
+            0,
+            0,
+            wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE | wm::SWP_ASYNCWINDOWPOS,
+        );
+        // SC_MOVE | HTCAPTION: start the system move loop, following the
+        // button that's still held down.
+        let _ = wm::PostMessageW(hwnd(h), wm::WM_SYSCOMMAND, WPARAM((wm::SC_MOVE | wm::HTCAPTION) as usize), LPARAM(0));
     }
 }
 

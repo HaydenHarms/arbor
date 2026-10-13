@@ -55,6 +55,10 @@ struct App {
     drop_zone: Option<Rect>,
     zone_drawn: Option<Instant>,
     dragging: Hwnd,
+    /// A left-button press on a maximized window (and where), which may turn
+    /// into a drag that Lattice has to start itself; and one that did.
+    press: Option<(Hwnd, (i32, i32))>,
+    restore_drag: Option<(Hwnd, (i32, i32))>,
 }
 
 thread_local! {
@@ -104,6 +108,7 @@ pub fn run() {
     trace!("started; hotkeys taken: {failed:?}");
     add_tray_icon(hwnd, "Lattice: dock, nest and zoom your windows");
     install_event_hooks(on_win_event);
+    install_mouse_hook(on_mouse);
     let overlay = create_overlay();
     with_app(|app| {
         app.hwnd = hwnd;
@@ -176,6 +181,10 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
         }
         WM_TIMER if wparam == DRAG_TIMER => {
             with_app(|app| app.drag_tick());
+            Some(0)
+        }
+        WM_RESTORE_DRAG => {
+            with_app(|app| app.restore_drag());
             Some(0)
         }
         WM_TRAY => {
@@ -294,7 +303,46 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
     });
 }
 
+/// How far (px) the pointer must move with the button down to count as a drag.
+const DRAG_THRESHOLD: i32 = 6;
+
+/// With Snap off, Windows won't drag a maximized window at all. So Lattice
+/// watches for a press on a maximized window that starts to move, and
+/// restores it under the pointer to carry on as an ordinary drag. This runs
+/// inside the system mouse hook, so it only notes things down and posts the
+/// real work to itself.
+fn on_mouse(ev: MouseEvent, pt: (i32, i32)) {
+    with_app(|app| match ev {
+        MouseEvent::LeftDown => {
+            let w = root_window_at(pt);
+            app.press = (is_maximized(w) && is_manageable(w)).then_some((w, pt));
+        }
+        MouseEvent::LeftUp => app.press = None,
+        MouseEvent::Move => {
+            if let Some((w, at)) = app.press {
+                if (pt.0 - at.0).abs() + (pt.1 - at.1).abs() > DRAG_THRESHOLD {
+                    app.press = None;
+                    app.restore_drag = Some((w, at));
+                    post_to_self(app.hwnd, WM_RESTORE_DRAG);
+                }
+            }
+        }
+    });
+}
+
 impl App {
+    /// A press on a maximized window has started moving: if it was on the
+    /// title bar, and Windows isn't handling it (Snap off), restore the
+    /// window and drag it.
+    fn restore_drag(&mut self) {
+        let Some((w, grab)) = self.restore_drag.take() else { return };
+        if snap_enabled() || !left_button_down() || !is_maximized(w) || !on_title_bar(w, grab) {
+            return;
+        }
+        trace!("restore-drag {w:#x} grabbed at {grab:?}");
+        restore_and_drag(w, grab, cursor_pos());
+    }
+
     fn monitor_of(&self, id: WinId) -> Option<MonId> {
         self.layouts.iter().find(|(_, l)| l.contains(id)).map(|(m, _)| *m)
     }
