@@ -593,8 +593,12 @@ pub fn create_overlay() -> Hwnd {
             return 0;
         };
         // Keep it out of screen captures, including our own, so capturing
-        // what's under it never sees it.
-        let _ = wm::SetWindowDisplayAffinity(h, wm::WDA_EXCLUDEFROMCAPTURE);
+        // what's under it never sees it. LATTICE_RECORDING=1 leaves it in,
+        // for screen recordings; Lattice captures before showing it anyway,
+        // except when a drag crosses to another display.
+        if std::env::var_os("LATTICE_RECORDING").is_none() {
+            let _ = wm::SetWindowDisplayAffinity(h, wm::WDA_EXCLUDEFROMCAPTURE);
+        }
         h.0 as isize
     }
 }

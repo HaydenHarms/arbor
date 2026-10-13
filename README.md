@@ -4,6 +4,8 @@ A nesting, zooming tiling window manager for Windows, written in Rust.
 
 Drag a window to the edge of the screen and it docks; everything else makes room. Drop a window on the edge of another and they split that space. Splits nest inside splits as deep as you like. Then zoom: frame one window or one group full-screen, step back out, or show everything at once.
 
+![Lattice docking, stacking, tabbing, filling the screen, zooming and resizing windows](docs/demo.gif)
+
 ## Install
 
 Grab `lattice.exe` from the latest [build](../../actions/workflows/build.yml) artifact, or build it yourself:
@@ -58,6 +60,7 @@ Each display keeps its own arrangement and camera.
 
 - **Turn off Windows Snap** (Settings → System → Multitasking → Snap windows). Snap and Lattice both act on edge drags. Lattice wins, but you'll see Snap's preview flash first.
 - Some laptops bind `Ctrl+Alt+Arrow` to screen rotation (Intel graphics). If Lattice can't claim a shortcut, it lists the ones that were taken when it starts.
+- **Recording your screen?** The drop-zone panel is hidden from screen captures. Set `LATTICE_RECORDING=1` before starting Lattice to show it in recordings.
 - **Quitting is safe.** Quitting, or choosing *Float all windows*, puts every window back on screen. If Lattice ever crashes, a crash handler moves any off-screen window back into view.
 
 ## How it works
