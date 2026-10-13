@@ -52,14 +52,14 @@ pub fn run() {
     set_dpi_aware();
     let hwnd = create_message_window(wndproc);
     let failed = register_hotkeys(hwnd, &HOTKEYS);
-    add_tray_icon(hwnd, "Arbor: dock, nest and zoom your windows");
+    add_tray_icon(hwnd, "Lattice: dock, nest and zoom your windows");
     install_event_hooks(on_win_event);
     with_app(|app| app.hwnd = hwnd);
     if !failed.is_empty() {
         message_box(
-            "Arbor",
+            "Lattice",
             &format!(
-                "These shortcuts are already taken by another app, so Arbor couldn't claim them:\n\n{}",
+                "These shortcuts are already taken by another app, so Lattice couldn't claim them:\n\n{}",
                 failed.join("\n")
             ),
         );
@@ -101,7 +101,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 14] = [
     (Cmd::Dock(Edge::Top), Mods::CtrlAltShift, VK_UP, "Ctrl+Alt+Shift+Up  dock top"),
     (Cmd::Dock(Edge::Bottom), Mods::CtrlAltShift, VK_DOWN, "Ctrl+Alt+Shift+Down  dock bottom"),
     (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float / unfloat window"),
-    (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Arbor"),
+    (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
 
 const MENU_SHOW_ALL: usize = 100;
@@ -125,7 +125,7 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
                 let hwnd = APP.with(|a| a.borrow().hwnd);
                 let pick = show_tray_menu(
                     hwnd,
-                    &[(MENU_SHOW_ALL, "Show everything"), (MENU_FLOAT_ALL, "Float all windows"), (0, ""), (MENU_QUIT, "Quit Arbor")],
+                    &[(MENU_SHOW_ALL, "Show everything"), (MENU_FLOAT_ALL, "Float all windows"), (0, ""), (MENU_QUIT, "Quit Lattice")],
                 );
                 match pick {
                     MENU_SHOW_ALL => run_cmd(Cmd::ShowAll),

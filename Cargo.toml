@@ -1,12 +1,12 @@
 [package]
-name = "arbor"
+name = "lattice"
 version = "0.1.0"
 edition = "2021"
 description = "A nesting, zooming tiling window manager for Windows"
 license = "MIT"
 
 [[bin]]
-name = "arbor"
+name = "lattice"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]

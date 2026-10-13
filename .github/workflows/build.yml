@@ -17,5 +17,5 @@ jobs:
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
-          name: arbor-windows-x64
-          path: target/release/arbor.exe
+          name: lattice-windows-x64
+          path: target/release/lattice.exe

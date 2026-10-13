@@ -12,5 +12,5 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("Arbor is a Windows window manager. On other platforms, run `cargo test` to exercise the layout engine.");
+    eprintln!("Lattice is a Windows window manager. On other platforms, run `cargo test` to exercise the layout engine.");
 }

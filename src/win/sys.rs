@@ -1,4 +1,4 @@
-//! Thin, safe-ish wrappers over the Win32 calls Arbor needs. All `unsafe`
+//! Thin, safe-ish wrappers over the Win32 calls Lattice needs. All `unsafe`
 //! lives here; the rest of the app deals in plain integers and `Rect`s.
 
 use crate::layout::Rect;
@@ -49,7 +49,7 @@ pub enum Mods {
 }
 
 /// Parked windows sit here: far off every display, but still a normal,
-/// restored window that Windows itself can bring back if Arbor dies.
+/// restored window that Windows itself can bring back if Lattice dies.
 const PARK: i32 = -32000;
 
 fn hwnd(h: Hwnd) -> HWND {
@@ -85,7 +85,7 @@ pub fn create_message_window(proc_: WndProc) -> Hwnd {
     *WNDPROC.lock().unwrap() = Some(proc_);
     unsafe {
         let inst = GetModuleHandleW(None).expect("module handle");
-        let class = w!("ArborWindowManager");
+        let class = w!("LatticeWindowManager");
         let wc = wm::WNDCLASSW {
             lpfnWndProc: Some(raw_wndproc),
             hInstance: inst.into(),
@@ -96,7 +96,7 @@ pub fn create_message_window(proc_: WndProc) -> Hwnd {
         let h = wm::CreateWindowExW(
             wm::WINDOW_EX_STYLE(0),
             class,
-            w!("Arbor"),
+            w!("Lattice"),
             wm::WINDOW_STYLE(0),
             0,
             0,
@@ -380,7 +380,7 @@ pub fn place_window(h: Hwnd, r: Rect) {
         _ => (0, 0, 0, 0),
     };
     unsafe {
-        // Async, so a hung app can never freeze Arbor.
+        // Async, so a hung app can never freeze Lattice.
         let _ = wm::SetWindowPos(
             hwnd(h),
             None,
@@ -408,7 +408,7 @@ pub fn park_window(h: Hwnd) {
 }
 
 // ---------------------------------------------------------------------------
-// Rescue: if Arbor ever crashes, no window is left parked off-screen.
+// Rescue: if Lattice ever crashes, no window is left parked off-screen.
 
 static RESCUE: Mutex<Vec<Hwnd>> = Mutex::new(Vec::new());
 
