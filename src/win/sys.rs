@@ -5,7 +5,10 @@ use crate::layout::Rect;
 use std::ffi::c_void;
 use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -66,6 +69,15 @@ fn mon(m: isize) -> HMONITOR {
 pub fn set_dpi_aware() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// Claims the per-session "Lattice is running" mutex. Returns false if another
+/// copy already holds it. The handle is kept open until the process exits.
+pub fn claim_single_instance() -> bool {
+    unsafe {
+        let made = CreateMutexW(None, true, w!("Local\\LatticeWindowManager"));
+        made.is_ok() && GetLastError() != ERROR_ALREADY_EXISTS
     }
 }
 

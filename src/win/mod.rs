@@ -37,6 +37,27 @@ thread_local! {
     static APP: RefCell<App> = RefCell::new(App::default());
 }
 
+/// Debug builds append a trace of what Lattice saw and decided to
+/// `%LOCALAPPDATA%\Lattice\lattice.log`. Release builds log nothing.
+macro_rules! trace {
+    ($($t:tt)*) => {
+        if cfg!(debug_assertions) {
+            trace_line(&format!($($t)*));
+        }
+    };
+}
+
+fn trace_line(s: &str) {
+    use std::io::Write;
+    let Some(dir) = std::env::var_os("LOCALAPPDATA") else { return };
+    let dir = std::path::PathBuf::from(dir).join("Lattice");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("lattice.log")) {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let _ = writeln!(f, "{}.{:03} {s}", t.as_secs(), t.subsec_millis());
+    }
+}
+
 fn with_app(f: impl FnOnce(&mut App)) {
     APP.with(|a| {
         // Skip re-entrant calls rather than panic: a nested message during a
@@ -48,10 +69,15 @@ fn with_app(f: impl FnOnce(&mut App)) {
 }
 
 pub fn run() {
+    if !claim_single_instance() {
+        message_box("Lattice", "Lattice is already running. Look for its icon in the system tray.");
+        return;
+    }
     install_rescue_hook();
     set_dpi_aware();
     let hwnd = create_message_window(wndproc);
     let failed = register_hotkeys(hwnd, &HOTKEYS);
+    trace!("started; hotkeys taken: {failed:?}");
     add_tray_icon(hwnd, "Lattice: dock, nest and zoom your windows");
     install_event_hooks(on_win_event);
     with_app(|app| app.hwnd = hwnd);
@@ -193,6 +219,9 @@ fn run_cmd(cmd: Cmd) {
 // Window events
 
 fn on_win_event(event: u32, hwnd: Hwnd) {
+    if !(EVENT_OBJECT_DESTROY..=EVENT_OBJECT_HIDE).contains(&event) {
+        trace!("event {event:#x} hwnd {hwnd:#x}");
+    }
     with_app(|app| match event {
         EVENT_SYSTEM_MOVESIZESTART => {
             if let Some(r) = visual_rect(hwnd) {
@@ -260,6 +289,7 @@ impl App {
         let pt = cursor_pos();
         let docked_on = self.monitor_of(hwnd);
         let resized = (now.w - start.w).abs() > 2 || (now.h - start.h).abs() > 2;
+        trace!("drag end {hwnd:#x}: {start:?} -> {now:?}, cursor {pt:?}, docked on {docked_on:?}, resized {resized}");
 
         if resized {
             // Dragged a border: move the seam so the neighbour follows.
@@ -277,10 +307,11 @@ impl App {
         let mon = monitor_at(pt);
         let area = work_area(mon);
         let target = match self.layouts.get(&mon) {
-            Some(l) => l.dock_target(area, pt.0, pt.1, hwnd),
+            Some(l) => l.dock_target(area, pt.0, pt.1, now, hwnd),
             // An empty display docks the first window at any edge.
-            None => Layout::new(GAP).dock_target(area, pt.0, pt.1, hwnd),
+            None => Layout::new(GAP).dock_target(area, pt.0, pt.1, now, hwnd),
         };
+        trace!("dock target {target:?} in {area:?}, manageable {}", is_manageable(hwnd));
         match target {
             Some((target, edge)) if is_manageable(hwnd) => {
                 if let Some(old) = docked_on {
@@ -309,6 +340,7 @@ impl App {
             .into_iter()
             .map(|(id, r)| (id, r, l.is_visible(id)))
             .collect();
+        trace!("apply {mon:#x}: {targets:?}");
         if l.is_empty() {
             self.layouts.remove(&mon);
         }

@@ -10,6 +10,14 @@
 
 pub type WinId = isize;
 
+/// How far (px) a dropped window must hang past a side of the display to dock there.
+const OVERHANG: i32 = 16;
+
+/// A leaf holding free space rather than a window. When the first window
+/// docks it takes half the display, and the other half is this, waiting
+/// for the next window. (0 is never a real window handle.)
+pub const EMPTY: WinId = 0;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub x: i32,
@@ -228,7 +236,7 @@ impl Layout {
     }
 
     pub fn contains(&self, id: WinId) -> bool {
-        self.root.as_ref().is_some_and(|r| r.contains(id))
+        id != EMPTY && self.root.as_ref().is_some_and(|r| r.contains(id))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -236,17 +244,36 @@ impl Layout {
     }
 
     /// Dock `id` against `edge`. With a `target`, it docks beside that window
-    /// (nesting a new split if needed); without one, beside everything in view.
+    /// (nesting a new split if needed), or fills it if the target is `EMPTY`.
+    /// Without one, it docks beside everything in view, filling the empty
+    /// space if that's what lies against `edge`.
     pub fn dock(&mut self, id: WinId, edge: Edge, target: Option<WinId>) {
         if self.contains(id) {
             self.remove(id);
         }
         let new = Node::Leaf(id);
         let Some(root) = self.root.as_mut() else {
-            self.root = Some(new);
+            // The first window takes the half of the display it was docked
+            // against; the other half stays free for the next one.
+            self.root = Some(if edge.before() {
+                Node::split(edge.axis(), vec![new, Node::Leaf(EMPTY)])
+            } else {
+                Node::split(edge.axis(), vec![Node::Leaf(EMPTY), new])
+            });
             self.camera.clear();
             return;
         };
+        let fill = match target {
+            Some(EMPTY) => root.path_to(EMPTY),
+            Some(_) => None,
+            None => self.empty_against(edge),
+        };
+        if let Some(path) = fill {
+            let root = self.root.as_mut().expect("root checked above");
+            *node_mut(root, &path).expect("valid empty path") = new;
+            return;
+        }
+        let root = self.root.as_mut().expect("root checked above");
         // Find the node to dock against: the target leaf, or the camera node.
         let path = match target.and_then(|t| root.path_to(t)) {
             Some(p) => p,
@@ -319,6 +346,9 @@ impl Layout {
     }
 
     pub fn remove(&mut self, id: WinId) -> bool {
+        if id == EMPTY {
+            return false;
+        }
         let Some(root) = self.root.as_mut() else { return false };
         let found = if matches!(root, Node::Leaf(w) if *w == id) {
             self.root = None;
@@ -326,10 +356,31 @@ impl Layout {
         } else {
             root.remove(id)
         };
+        // Empty space with no windows left is no arrangement at all.
+        if matches!(self.root, Some(Node::Leaf(EMPTY))) {
+            self.root = None;
+        }
         if found {
             self.fix_camera();
         }
         found
+    }
+
+    /// Path to the empty space, if it fills the side of the view at `edge`.
+    fn empty_against(&self, edge: Edge) -> Option<Vec<usize>> {
+        let root = self.root.as_ref()?;
+        let canvas = Rect::new(0, 0, 10_000, 10_000);
+        let cam = self.camera_rect(canvas);
+        let mut rects = Vec::new();
+        root.layout(canvas, 0, &mut rects);
+        let (_, r) = rects.into_iter().find(|(w, _)| *w == EMPTY)?;
+        let full_side = match edge {
+            Edge::Left => r.x == cam.x && r.y == cam.y && r.h == cam.h,
+            Edge::Right => r.x + r.w == cam.x + cam.w && r.y == cam.y && r.h == cam.h,
+            Edge::Top => r.y == cam.y && r.x == cam.x && r.w == cam.w,
+            Edge::Bottom => r.y + r.h == cam.y + cam.h && r.x == cam.x && r.w == cam.w,
+        };
+        full_side.then(|| root.path_to(EMPTY)).flatten()
     }
 
     fn fix_camera(&mut self) {
@@ -345,6 +396,13 @@ impl Layout {
     /// the camera fill `area`; windows outside it are laid out as if the
     /// whole tree were scaled up around the camera, so they land off-screen.
     pub fn layout(&self, area: Rect) -> Vec<(WinId, Rect)> {
+        let mut out = self.layout_with_empty(area);
+        out.retain(|(w, _)| *w != EMPTY);
+        out
+    }
+
+    /// Like `layout`, but including the rect of the empty space, if any.
+    fn layout_with_empty(&self, area: Rect) -> Vec<(WinId, Rect)> {
         let Some(root) = &self.root else { return vec![] };
         let mut out = Vec::new();
         // Lay the whole tree out in a virtual canvas, then map the camera's
@@ -395,7 +453,7 @@ impl Layout {
     /// Frame the smallest node containing `id` that isn't just the leaf itself:
     /// one step deeper toward the window.
     pub fn zoom_in_toward(&mut self, id: WinId) {
-        let Some(path) = self.root.as_ref().and_then(|r| r.path_to(id)) else { return };
+        let Some(path) = self.root.as_ref().filter(|_| id != EMPTY).and_then(|r| r.path_to(id)) else { return };
         if path.len() > self.camera.len() && path.starts_with(&self.camera) {
             let next = path[..self.camera.len() + 1].to_vec();
             self.move_camera(next);
@@ -404,7 +462,7 @@ impl Layout {
 
     /// Frame a single window on its own.
     pub fn frame(&mut self, id: WinId) {
-        if let Some(p) = self.root.as_ref().and_then(|r| r.path_to(id)) {
+        if let Some(p) = self.root.as_ref().filter(|_| id != EMPTY).and_then(|r| r.path_to(id)) {
             self.move_camera(p);
         }
     }
@@ -430,7 +488,8 @@ impl Layout {
             return;
         };
         let j = i as i32 + dir;
-        if j >= 0 && (j as usize) < children.len() {
+        // Nothing to look at in the empty space, so never frame it.
+        if j >= 0 && (j as usize) < children.len() && children[j as usize] != Node::Leaf(EMPTY) {
             let mut p = parent.to_vec();
             p.push(j as usize);
             self.move_camera(p);
@@ -517,9 +576,18 @@ impl Layout {
         }
     }
 
-    /// Which window (if any) has its edge near the point, for drag-to-dock.
-    /// Returns the window and which of its edges the point is closest to.
-    pub fn dock_target(&self, area: Rect, px: i32, py: i32, exclude: WinId) -> Option<(Option<WinId>, Edge)> {
+    /// Where a window dropped with the pointer at (px, py) should dock, for
+    /// drag-to-dock. `dropped` is where the dragged window `exclude` ended up.
+    /// Returns the window to dock beside (None for the whole view) and which
+    /// of its edges.
+    pub fn dock_target(
+        &self,
+        area: Rect,
+        px: i32,
+        py: i32,
+        dropped: Rect,
+        exclude: WinId,
+    ) -> Option<(Option<WinId>, Edge)> {
         let band = 48;
         // The display's own edges dock beside everything in view.
         if px <= area.x + band {
@@ -528,15 +596,43 @@ impl Layout {
         if px >= area.x + area.w - band {
             return Some((None, Edge::Right));
         }
-        if py <= area.y + band / 2 {
+        // Top only when the pointer is pressed against it: docked windows'
+        // title bars live up there, and sliding one sideways shouldn't re-dock.
+        if py <= area.y + 2 {
             return Some((None, Edge::Top));
         }
         if py >= area.y + area.h - band {
             return Some((None, Edge::Bottom));
         }
-        for (id, r) in self.layout(area) {
+        // Pushing the window itself past the left or right edge counts too:
+        // people grab a title bar mid-way and shove until the window hits the
+        // side, without the pointer ever reaching it. (Not top or bottom:
+        // Windows stops title bars at the top, and tall windows often hang
+        // off the bottom by accident.)
+        let over_left = area.x - dropped.x;
+        let over_right = (dropped.x + dropped.w) - (area.x + area.w);
+        if over_left.max(over_right) >= OVERHANG {
+            let edge = if over_left >= over_right { Edge::Left } else { Edge::Right };
+            return Some((None, edge));
+        }
+        for (id, r) in self.layout_with_empty(area) {
             if id == exclude || !r.contains(px, py) {
                 continue;
+            }
+            // Dropping anywhere in the empty space fills it. The edge is the
+            // side of the display the space lies on, which matters if the
+            // dragged window was the only one docked: then the layout empties
+            // and it docks afresh, against that side.
+            if id == EMPTY {
+                let dx = (r.x + r.w / 2 - (area.x + area.w / 2)) as f32 / area.w as f32;
+                let dy = (r.y + r.h / 2 - (area.y + area.h / 2)) as f32 / area.h as f32;
+                let edge = match (dx.abs() >= dy.abs(), dx < 0.0, dy < 0.0) {
+                    (true, true, _) => Edge::Left,
+                    (true, false, _) => Edge::Right,
+                    (false, _, true) => Edge::Top,
+                    (false, _, false) => Edge::Bottom,
+                };
+                return Some((Some(EMPTY), edge));
             }
             // Closest edge, measured relative to the window's size so tall
             // and wide windows behave the same.
@@ -573,10 +669,88 @@ mod tests {
     }
 
     #[test]
-    fn first_window_fills_screen() {
+    fn first_window_takes_its_half() {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
-        assert_eq!(rect_of(&l, 1), AREA);
+        assert_eq!(rect_of(&l, 1), Rect::new(0, 0, 500, 600));
+        assert_eq!(l.layout(AREA).len(), 1, "empty space is not a window");
+        assert!(!l.contains(EMPTY));
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Bottom, None);
+        assert_eq!(rect_of(&l, 1), Rect::new(0, 300, 1000, 300));
+    }
+
+    #[test]
+    fn next_window_fills_the_empty_half() {
+        // Docked at the opposite edge.
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        assert_eq!(rect_of(&l, 2), Rect::new(500, 0, 500, 600));
+        assert!(!l.root.as_ref().unwrap().contains(EMPTY));
+        // Dropped into the empty space.
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Right, None);
+        let target = l.dock_target(AREA, 200, 300, Rect::new(100, 100, 300, 300), 2);
+        assert_eq!(target, Some((Some(EMPTY), Edge::Left)));
+        l.dock(2, Edge::Left, Some(EMPTY));
+        assert_eq!(rect_of(&l, 2), Rect::new(0, 0, 500, 600));
+        assert_eq!(rect_of(&l, 1), Rect::new(500, 0, 500, 600));
+    }
+
+    #[test]
+    fn lone_window_dragged_into_empty_half_moves_there() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        let (target, edge) = l.dock_target(AREA, 800, 300, Rect::new(600, 100, 300, 300), 1).unwrap();
+        assert_eq!((target, edge), (Some(EMPTY), Edge::Right));
+        // The app undocks the window first, then docks it at the drop.
+        l.remove(1);
+        l.dock(1, edge, target);
+        assert_eq!(rect_of(&l, 1), Rect::new(500, 0, 500, 600));
+    }
+
+    #[test]
+    fn docking_the_occupied_side_keeps_the_empty_space() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Left, None);
+        assert_eq!(l.layout(AREA).len(), 2);
+        assert!(l.root.as_ref().unwrap().contains(EMPTY));
+        let r2 = rect_of(&l, 2);
+        assert_eq!((r2.x, r2.h), (0, 600));
+    }
+
+    #[test]
+    fn lone_window_can_be_resized_and_removed() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.apply_resize(1, Rect::new(0, 0, 700, 600), AREA);
+        assert_eq!(rect_of(&l, 1), Rect::new(0, 0, 700, 600));
+        let p = l.placement_of(1).unwrap();
+        l.remove(1);
+        assert!(l.is_empty(), "only empty space left means no arrangement");
+        l.restore(1, p);
+        assert_eq!(rect_of(&l, 1), Rect::new(0, 0, 500, 600));
+    }
+
+    #[test]
+    fn camera_never_frames_empty_space() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.frame(EMPTY);
+        assert!(l.camera.is_empty());
+        l.frame(1);
+        l.neighbour(1);
+        assert!(l.is_visible(1));
+    }
+
+    #[test]
+    fn top_docks_only_when_pressed_against_it() {
+        let l = Layout::new(0);
+        let w = Rect::new(400, 0, 300, 300);
+        assert_eq!(l.dock_target(AREA, 500, 0, w, 9), Some((None, Edge::Top)));
+        assert_eq!(l.dock_target(AREA, 500, 15, w, 9), None);
     }
 
     #[test]
@@ -592,7 +766,7 @@ mod tests {
     fn same_axis_docks_as_siblings_not_nested() {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
-        l.dock(2, Edge::Right, Some(1));
+        l.dock(2, Edge::Right, None); // fills the empty half
         l.dock(3, Edge::Right, Some(2));
         let Some(Node::Split { children, .. }) = &l.root else { panic!() };
         assert_eq!(children.len(), 3);
@@ -705,10 +879,25 @@ mod tests {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
         l.dock(2, Edge::Right, None);
-        assert_eq!(l.dock_target(AREA, 2, 300, 9), Some((None, Edge::Left)));
-        assert_eq!(l.dock_target(AREA, 520, 300, 9), Some((Some(2), Edge::Left)));
-        assert_eq!(l.dock_target(AREA, 750, 580, 9), Some((None, Edge::Bottom)));
-        assert_eq!(l.dock_target(AREA, 750, 300, 9), None);
+        let w = Rect::new(400, 100, 300, 300);
+        assert_eq!(l.dock_target(AREA, 2, 300, w, 9), Some((None, Edge::Left)));
+        assert_eq!(l.dock_target(AREA, 520, 300, w, 9), Some((Some(2), Edge::Left)));
+        assert_eq!(l.dock_target(AREA, 750, 580, w, 9), Some((None, Edge::Bottom)));
+        assert_eq!(l.dock_target(AREA, 750, 300, w, 9), None);
+    }
+
+    #[test]
+    fn dock_target_window_pushed_past_side() {
+        let l = Layout::new(0);
+        // Pointer mid-screen, but the window hangs off the left or right.
+        let off_left = Rect::new(-32, 72, 600, 400);
+        assert_eq!(l.dock_target(AREA, 400, 105, off_left, 9), Some((None, Edge::Left)));
+        let off_right = Rect::new(700, 72, 400, 400);
+        assert_eq!(l.dock_target(AREA, 800, 105, off_right, 9), Some((None, Edge::Right)));
+        // A few pixels over is just sloppy placement, and hanging off the
+        // bottom never docks.
+        assert_eq!(l.dock_target(AREA, 400, 105, Rect::new(-8, 72, 600, 400), 9), None);
+        assert_eq!(l.dock_target(AREA, 400, 300, Rect::new(100, 200, 600, 900), 9), None);
     }
 
     #[test]
