@@ -4,7 +4,7 @@
 mod sys;
 
 use crate::frost;
-use crate::layout::{ease, fullscreen_drop, Edge, Layout, Placement, Rect, WinId};
+use crate::layout::{ease, fullscreen_drop, tab_bar_over, Edge, Layout, Placement, Rect, WinId};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,9 @@ use sys::*;
 /// Every layout motion: split, dock, zoom, close.
 const MOTION: Duration = Duration::from_millis(240);
 const GAP: i32 = 8;
+/// Height of the band above a tab group for its strip of tabs, at 96 DPI.
+/// The strip leaves half a gap under it.
+const TAB_BAR: f32 = 32.0;
 const ANIM_TIMER: usize = 1;
 /// Updates the drop zone while a window is being dragged.
 const DRAG_TIMER: usize = 2;
@@ -59,6 +62,27 @@ fn frosted(r: Rect, b: &Backdrop) -> Vec<u32> {
 
 type MonId = isize;
 
+/// A fresh, empty arrangement for display `m`.
+fn new_layout(m: MonId) -> Layout {
+    let mut l = Layout::new(GAP);
+    l.tab_bar = (TAB_BAR * monitor_scale(m)).round() as i32;
+    l
+}
+
+/// A tab strip over a tab group: the window showing under it, and the
+/// height of the band it sits in.
+struct Bar {
+    strip: Hwnd,
+    owner: WinId,
+    band: i32,
+}
+
+/// Where the strip goes in the band above window rect `r`.
+fn strip_rect(r: Rect, band: i32) -> Rect {
+    let b = tab_bar_over(r, band);
+    Rect::new(b.x, b.y, b.w, b.h - GAP / 2)
+}
+
 struct Anim {
     start: Instant,
     from: HashMap<WinId, Rect>,
@@ -87,6 +111,23 @@ struct App {
     /// A floating window framed to fill its display, and where it was, to
     /// put it back when you step out.
     framed_float: Option<(WinId, Rect)>,
+    /// Tab strips in use, and hidden ones to reuse.
+    bars: Vec<Bar>,
+    spare_strips: Vec<Hwnd>,
+    /// Windows' icons, for their tabs.
+    icons: HashMap<WinId, isize>,
+    /// A left-button press on a tab (its window, and where), which is a
+    /// click or the start of dragging the tab out.
+    tab_press: Option<(WinId, (i32, i32))>,
+    /// A tab pulled off its strip, being carried by the pointer: the
+    /// window, and its rect relative to the pointer.
+    tearing: Option<(WinId, Rect)>,
+    /// The last app window to have the focus, and when it last went away
+    /// (closed, hidden or minimized). Windows then hands the focus to
+    /// another window by itself, which may be a parked one: that isn't a
+    /// request to show it.
+    last_fg: Hwnd,
+    focus_lost: Option<Instant>,
 }
 
 thread_local! {
@@ -137,6 +178,7 @@ pub fn run() {
     add_tray_icon(hwnd, "Lattice: dock, nest and zoom your windows");
     install_event_hooks(on_win_event);
     install_mouse_hook(hwnd, WM_MOUSE_HOOK);
+    on_strip_input(on_strip);
     let overlay = create_overlay();
     with_app(|app| {
         app.hwnd = hwnd;
@@ -169,12 +211,14 @@ enum Cmd {
     Back,
     Forward,
     Dock(Edge),
+    PrevTab,
+    NextTab,
     Float,
     FloatAll,
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 14] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 16] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::ZoomOut, Mods::CtrlAlt, VK_UP, "Ctrl+Alt+Up  step out a level"),
     (Cmd::ZoomIn, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  step in toward the pointer"),
@@ -187,6 +231,8 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 14] = [
     (Cmd::Dock(Edge::Right), Mods::CtrlAltShift, VK_RIGHT, "Ctrl+Alt+Shift+Right  dock right"),
     (Cmd::Dock(Edge::Top), Mods::CtrlAltShift, VK_UP, "Ctrl+Alt+Shift+Up  dock top"),
     (Cmd::Dock(Edge::Bottom), Mods::CtrlAltShift, VK_DOWN, "Ctrl+Alt+Shift+Down  dock bottom"),
+    (Cmd::PrevTab, Mods::CtrlAlt, VK_PRIOR, "Ctrl+Alt+Page Up  previous tab"),
+    (Cmd::NextTab, Mods::CtrlAlt, VK_NEXT, "Ctrl+Alt+Page Down  next tab"),
     (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float / unfloat window"),
     (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
@@ -257,7 +303,10 @@ fn run_cmd(cmd: Cmd) {
             Cmd::ShowAll => app.camera(mon, |l| l.zoom_all()),
             Cmd::ZoomOut if !framed => app.camera(mon, |l| l.zoom_out()),
             Cmd::ZoomIn => {
-                let under = root_window_at(cursor_pos());
+                let mut under = root_window_at(cursor_pos());
+                if let Some(b) = app.bars.iter().find(|b| b.strip == under) {
+                    under = b.owner;
+                }
                 app.camera(mon, |l| l.zoom_in_toward(under));
             }
             Cmd::Frame => {
@@ -277,6 +326,13 @@ fn run_cmd(cmd: Cmd) {
             Cmd::Back if !framed => app.camera(mon, |l| l.back()),
             Cmd::Forward => app.camera(mon, |l| l.forward()),
             Cmd::ZoomOut | Cmd::Back => {}
+            Cmd::PrevTab | Cmd::NextTab => {
+                let dir = if matches!(cmd, Cmd::NextTab) { 1 } else { -1 };
+                let next = app.monitor_of(fg).and_then(|m| app.layouts[&m].tab_beside(fg, dir));
+                if let Some(next) = next {
+                    app.select_tab(next);
+                }
+            }
             Cmd::Dock(edge) => {
                 if is_manageable(fg) {
                     app.forget_framed(fg);
@@ -308,7 +364,7 @@ fn run_cmd(cmd: Cmd) {
 // Window events
 
 fn on_win_event(event: u32, hwnd: Hwnd) {
-    if !(EVENT_OBJECT_DESTROY..=EVENT_OBJECT_HIDE).contains(&event) {
+    if !(EVENT_OBJECT_DESTROY..=EVENT_OBJECT_HIDE).contains(&event) && event != EVENT_OBJECT_NAMECHANGE {
         trace!("event {event:#x} hwnd {hwnd:#x}");
     }
     with_app(|app| match event {
@@ -330,6 +386,7 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
             app.drag_ended(hwnd);
         }
         EVENT_SYSTEM_MINIMIZESTART => {
+            app.focus_gone(hwnd);
             app.forget_framed(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
                 if let Some(p) = app.layouts[&m].placement_of(hwnd) {
@@ -341,11 +398,13 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
         }
         EVENT_SYSTEM_MINIMIZEEND => {
             if let Some((m, p)) = app.minimized.remove(&hwnd) {
-                app.layouts.entry(m).or_insert_with(|| Layout::new(GAP)).restore(hwnd, p);
+                app.layouts.entry(m).or_insert_with(|| new_layout(m)).restore(hwnd, p);
                 app.apply(m);
             }
         }
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE => {
+            app.focus_gone(hwnd);
+            app.icons.remove(&hwnd);
             app.minimized.remove(&hwnd);
             app.forget_framed(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
@@ -353,8 +412,14 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
                 app.apply(m);
             }
         }
+        EVENT_SYSTEM_FOREGROUND => app.focus_changed(hwnd),
+        EVENT_OBJECT_NAMECHANGE if app.layouts.values().any(|l| l.group(hwnd).is_some()) => app.refresh_bars(),
         _ => {}
     });
+}
+
+fn on_strip(strip: Hwnd, ev: StripEvent, pt: (i32, i32)) {
+    with_app(|app| app.strip_input(strip, ev, pt));
 }
 
 /// How far (px) the pointer must move with the button down to count as a drag.
@@ -366,6 +431,19 @@ const DRAG_THRESHOLD: i32 = 6;
 /// ordinary drag.
 fn on_mouse(ev: MouseEvent, pt: (i32, i32)) {
     with_app(|app| match ev {
+        // A torn-off tab follows the pointer until the button comes up,
+        // then drops like any dragged window.
+        MouseEvent::Move if app.tearing.is_some() => {
+            let (w, off) = app.tearing.expect("checked");
+            place_window(w, Rect::new(pt.0 + off.x, pt.1 + off.y, off.w, off.h));
+        }
+        MouseEvent::LeftUp if app.tearing.is_some() => {
+            let (w, _) = app.tearing.take().expect("checked");
+            kill_timer(app.hwnd, DRAG_TIMER);
+            app.show_drop_zone(None);
+            app.backdrop = None;
+            app.drag_ended(w);
+        }
         MouseEvent::LeftDown => {
             let w = root_window_at(pt);
             app.press = (is_maximized(w) && is_manageable(w)).then_some((w, pt));
@@ -408,9 +486,182 @@ impl App {
 
     fn dock(&mut self, id: WinId, mon: MonId, edge: Edge, target: Option<WinId>) {
         restore_if_maximized(id);
-        self.layouts.entry(mon).or_insert_with(|| Layout::new(GAP)).dock(id, edge, target);
+        self.layouts.entry(mon).or_insert_with(|| new_layout(mon)).dock(id, edge, target);
         rescue_list_add(id);
         self.apply(mon);
+    }
+
+    /// Add `id` as a tab in docked window `onto`'s spot on display `mon`.
+    fn tab(&mut self, id: WinId, mon: MonId, onto: WinId) {
+        let Some(l) = self.layouts.get_mut(&mon) else { return };
+        restore_if_maximized(id);
+        if l.tab(id, onto) {
+            rescue_list_add(id);
+        }
+        self.apply(mon);
+    }
+
+    /// Show tab `id` in its group, at once, and give it the focus.
+    fn select_tab(&mut self, id: WinId) {
+        let Some(m) = self.monitor_of(id) else { return };
+        self.finish_anim();
+        let area = work_area(m);
+        let l = self.layouts.get_mut(&m).expect("docked");
+        let old = l.group(id).map(|g| g.shown());
+        trace!("select tab {id:#x} (was {old:?})");
+        if l.reveal(id) {
+            let to = l.layout(area).into_iter().find(|(w, _)| *w == id).map(|(_, r)| r);
+            match (to, old) {
+                // Swapped in place: no need to animate.
+                (Some(r), Some(old)) if l.is_visible(id) && old != id => {
+                    place_window(id, r);
+                    park_window(old);
+                }
+                _ => {
+                    set_foreground(id);
+                    self.apply(m);
+                    return;
+                }
+            }
+        }
+        set_foreground(id);
+        self.refresh_bars();
+    }
+
+    /// The tab `id` was pulled off its strip at `pt`: take it out of its
+    /// group and carry on dragging it like any window, to dock or float.
+    ///
+    /// Lattice carries it itself (see `on_mouse`): the button went down on
+    /// the strip, not the window, so Windows won't drag the window.
+    fn tear_tab(&mut self, id: WinId, pt: (i32, i32)) {
+        let Some(m) = self.monitor_of(id) else { return };
+        self.finish_anim();
+        let Some(r) = self.layouts[&m].layout(work_area(m)).into_iter().find(|(w, _)| *w == id).map(|(_, r)| r) else {
+            return;
+        };
+        trace!("tear tab {id:#x} at {pt:?}");
+        self.undock(id);
+        self.apply(m);
+        // A bit smaller than the spot it filled, hanging from the pointer
+        // by its title bar.
+        let (w, h) = ((r.w * 2 / 3).max(r.w.min(640)), (r.h * 2 / 3).max(r.h.min(480)));
+        let grab = (16.0 * monitor_scale(m)) as i32;
+        let at = Rect::new(pt.0 - w / 2, pt.1 - grab, w, h);
+        place_window(id, at);
+        set_foreground(id);
+        self.tearing = Some((id, Rect::new(-w / 2, -grab, w, h)));
+        self.drag_start.insert(id, at);
+        self.backdrop = Some(snapshot(work_area(m)));
+        set_timer(self.hwnd, DRAG_TIMER, 16);
+    }
+
+    fn strip_input(&mut self, strip: Hwnd, ev: StripEvent, pt: (i32, i32)) {
+        let Some(owner) = self.bars.iter().find(|b| b.strip == strip).map(|b| b.owner) else { return };
+        let Some(m) = self.monitor_of(owner) else { return };
+        let tab = strip_tab_at(strip, pt).and_then(|i| self.layouts[&m].group(owner)?.wins.get(i).copied());
+        match ev {
+            StripEvent::Down => self.tab_press = tab.map(|w| (w, pt)),
+            StripEvent::Drag => {
+                if let Some((w, at)) = self.tab_press {
+                    if (pt.0 - at.0).abs() + (pt.1 - at.1).abs() > DRAG_THRESHOLD {
+                        self.tab_press = None;
+                        self.tear_tab(w, pt);
+                    }
+                }
+            }
+            StripEvent::Up => {
+                if let Some((w, _)) = self.tab_press.take() {
+                    self.select_tab(w);
+                }
+            }
+            StripEvent::Middle => {
+                if let Some(w) = tab {
+                    close_window(w);
+                }
+            }
+        }
+    }
+
+    /// Window `hwnd` got the focus. If it's docked out of sight (a hidden
+    /// tab, or off camera), the user went to it, by Alt+Tab or the taskbar:
+    /// bring it into view.
+    fn focus_changed(&mut self, hwnd: Hwnd) {
+        let handed_on = self.focus_lost.take().is_some_and(|t| t.elapsed() < Duration::from_millis(500));
+        if is_manageable(hwnd) {
+            self.last_fg = hwnd;
+        }
+        if let Some(m) = self.monitor_of(hwnd).filter(|_| !handed_on) {
+            if self.layouts.get_mut(&m).is_some_and(|l| l.reveal(hwnd)) {
+                trace!("revealed {hwnd:#x}");
+                self.apply(m);
+                return;
+            }
+        }
+        self.refresh_bars();
+    }
+
+    /// Window `hwnd` closed, hid or minimized.
+    fn focus_gone(&mut self, hwnd: Hwnd) {
+        if hwnd == self.last_fg {
+            self.focus_lost = Some(Instant::now());
+        }
+    }
+
+    /// Bring every tab strip up to date: one over each tab group, showing
+    /// its tabs, where its group is (unless the group is mid-motion, when
+    /// `tick` moves it).
+    fn refresh_bars(&mut self) {
+        let fg = foreground_window();
+        let mut wanted = Vec::new();
+        for (&m, l) in &self.layouts {
+            let rects = l.layout(work_area(m));
+            for g in l.groups() {
+                let owner = g.shown();
+                let r = rects.iter().find(|(w, _)| *w == owner).map(|(_, r)| *r);
+                wanted.push((g.wins.clone(), g.active, r, l.is_visible(owner), l.tab_bar));
+            }
+        }
+        let mut old = std::mem::take(&mut self.bars);
+        for (wins, active, r, visible, band) in wanted {
+            let owner = wins[active];
+            let strip = match old.iter().position(|b| wins.contains(&b.owner)) {
+                Some(i) => old.swap_remove(i).strip,
+                None => self.spare_strips.pop().unwrap_or_else(create_strip),
+            };
+            let strip = if is_window(strip) { strip } else { create_strip() };
+            let tabs = wins
+                .iter()
+                .map(|&w| Tab { title: window_title(w), icon: *self.icons.entry(w).or_insert_with(|| window_icon(w)) })
+                .collect();
+            set_strip(strip, tabs, active, fg == owner);
+            let moving = self.anim.as_ref().is_some_and(|a| a.to.iter().any(|t| t.0 == owner));
+            if let (false, Some(r)) = (moving, r) {
+                place_strip(strip, strip_rect(r, band), owner, visible);
+            }
+            self.bars.push(Bar { strip, owner, band });
+        }
+        for b in old {
+            place_strip(b.strip, Rect::new(0, 0, 0, 0), 0, false);
+            self.spare_strips.push(b.strip);
+        }
+    }
+
+    /// Window `id` has been put at `r`: bring its tab strip along.
+    fn follow(&self, id: WinId, r: Rect, show: bool) {
+        if let Some(b) = self.bars.iter().find(|b| b.owner == id) {
+            place_strip(b.strip, strip_rect(r, b.band), id, show);
+        }
+    }
+
+    /// The docked window a window being dragged would join as a tab if
+    /// dropped now, and its display.
+    fn tab_target(&self, hwnd: Hwnd, pt: (i32, i32)) -> Option<(MonId, WinId)> {
+        if !is_manageable(hwnd) {
+            return None;
+        }
+        let mon = monitor_at(pt);
+        let onto = self.layouts.get(&mon)?.tab_target(work_area(mon), pt.0, pt.1, hwnd)?;
+        Some((mon, onto))
     }
 
     /// Fill display `mon` with floating window `id`, remembering that it
@@ -461,7 +712,7 @@ impl App {
         let area = work_area(mon);
         let target = match self.layouts.get(&mon) {
             Some(l) => l.dock_target(area, pt.0, pt.1, hwnd),
-            None => Layout::new(GAP).dock_target(area, pt.0, pt.1, hwnd),
+            None => new_layout(mon).dock_target(area, pt.0, pt.1, hwnd),
         };
         target.map(|(target, edge)| (mon, target, edge))
     }
@@ -481,10 +732,12 @@ impl App {
             None
         } else if let Some(mon) = self.fullscreen_target(hwnd, pt) {
             Some(framed_rect(mon))
+        } else if let Some((mon, onto)) = self.tab_target(hwnd, pt) {
+            self.layouts[&mon].slot(onto, work_area(mon))
         } else {
             self.drop_target(hwnd, pt).and_then(|(mon, target, edge)| {
                 let area = work_area(mon);
-                let l = self.layouts.get(&mon).cloned().unwrap_or_else(|| Layout::new(GAP));
+                let l = self.layouts.get(&mon).cloned().unwrap_or_else(|| new_layout(mon));
                 l.preview(hwnd, edge, target, area)
             })
         };
@@ -558,6 +811,18 @@ impl App {
             return;
         }
 
+        // Dropped on a docked window's title bar, or a strip of tabs: join
+        // that window's spot as a tab.
+        if let Some((mon, onto)) = self.tab_target(hwnd, pt) {
+            trace!("drop as tab on {onto:#x}");
+            if let Some(old) = docked_on.filter(|&m| m != mon) {
+                self.undock(hwnd);
+                self.apply(old);
+            }
+            self.tab(hwnd, mon, onto);
+            return;
+        }
+
         // Dragged the title bar: dock where it was dropped, or float it.
         let drop = self.drop_target(hwnd, pt);
         trace!("drop target {drop:?}");
@@ -594,6 +859,7 @@ impl App {
             self.layouts.remove(&mon);
         }
         self.animate(targets);
+        self.refresh_bars();
     }
 
     fn apply_all(&mut self) {
@@ -608,6 +874,11 @@ impl App {
         let mut to = self.anim.take().map(|a| a.to).unwrap_or_default();
         for t in targets {
             to.retain(|x| x.0 != t.0);
+            // A parked window staying out of sight (a hidden tab, say) stays
+            // put, rather than showing where it would be while others move.
+            if !t.2 && visual_rect(t.0).is_some_and(|r| r.x <= -20_000) {
+                continue;
+            }
             to.push(t);
         }
         to.retain(|x| is_window(x.0));
@@ -631,7 +902,9 @@ impl App {
         let k = ease(t);
         for (id, to, _) in &anim.to {
             let from = anim.from.get(id).copied().unwrap_or(*to);
-            place_window(*id, Rect::lerp(from, *to, k));
+            let r = Rect::lerp(from, *to, k);
+            place_window(*id, r);
+            self.follow(*id, r, true);
         }
         if t >= 1.0 {
             self.finish_anim();
@@ -648,6 +921,7 @@ impl App {
                 } else {
                     park_window(id);
                 }
+                self.follow(id, r, visible);
             }
         }
     }
@@ -666,6 +940,7 @@ impl App {
         self.layouts.clear();
         self.minimized.clear();
         rescue_list_clear();
+        self.refresh_bars();
     }
 }
 

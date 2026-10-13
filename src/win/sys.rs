@@ -9,19 +9,30 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, BOOL, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW, MonitorFromPoint,
-    MonitorFromWindow, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, SRCCOPY,
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
+    InvalidateRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, ScreenToClient, SelectObject, SetBkMode,
+    SetStretchBltMode, SetTextColor, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBITMAP,
+    HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, NULL_PEN, PAINTSTRUCT, SRCCOPY,
+    TRANSPARENT,
+};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{
+    GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, RegisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_LBUTTON,
+    GetAsyncKeyState, GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+    MOD_NOREPEAT, MOD_SHIFT, VK_LBUTTON,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -31,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging as wm;
 pub type Hwnd = isize;
 
 pub use wm::{
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_NAMECHANGE, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, WM_CLOSE, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP,
     WM_RBUTTONUP, WM_TIMER,
 };
@@ -47,6 +58,8 @@ pub const VK_RIGHT: u32 = 0x27;
 pub const VK_DOWN: u32 = 0x28;
 pub const VK_OEM_4: u32 = 0xDB; // [
 pub const VK_OEM_6: u32 = 0xDD; // ]
+pub const VK_PRIOR: u32 = 0x21; // Page Up
+pub const VK_NEXT: u32 = 0x22; // Page Down
 pub const VK_F: u32 = 0x46;
 pub const VK_Q: u32 = 0x51;
 
@@ -174,6 +187,8 @@ pub fn install_event_hooks(f: EventFn) {
         (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
+        (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+        (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
     ];
     for (lo, hi) in ranges {
         unsafe {
@@ -678,6 +693,317 @@ pub fn hide_overlay(h: Hwnd) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Tab strips: a small window over each tab group, showing its tabs. It
+// never takes focus; clicks and drags on it go to the app's callback.
+
+/// One tab as a strip shows it.
+#[derive(Clone)]
+pub struct Tab {
+    pub title: String,
+    pub icon: isize,
+}
+
+struct StripData {
+    tabs: Vec<Tab>,
+    active: usize,
+    focused: bool,
+    light: bool,
+}
+
+static STRIPS: Mutex<Vec<(Hwnd, StripData)>> = Mutex::new(Vec::new());
+
+/// Mouse input on a strip, with the pointer in screen coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StripEvent {
+    Down,
+    /// The pointer moved with the left button held since a `Down`.
+    Drag,
+    Up,
+    Middle,
+}
+
+type StripFn = fn(Hwnd, StripEvent, (i32, i32));
+static STRIP_FN: Mutex<Option<StripFn>> = Mutex::new(None);
+
+unsafe extern "system" fn strip_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let ev = match msg {
+        wm::WM_MOUSEACTIVATE => return LRESULT(wm::MA_NOACTIVATE as isize),
+        wm::WM_ERASEBKGND => return LRESULT(1),
+        wm::WM_PAINT => {
+            paint_strip(h);
+            return LRESULT(0);
+        }
+        wm::WM_LBUTTONDOWN => {
+            SetCapture(h);
+            StripEvent::Down
+        }
+        wm::WM_MOUSEMOVE if GetCapture() == h => StripEvent::Drag,
+        wm::WM_LBUTTONUP if GetCapture() == h => {
+            let _ = ReleaseCapture();
+            StripEvent::Up
+        }
+        wm::WM_MBUTTONUP => StripEvent::Middle,
+        _ => return wm::DefWindowProcW(h, msg, wp, lp),
+    };
+    let mut p = POINT { x: lp.0 as i16 as i32, y: (lp.0 >> 16) as i16 as i32 };
+    let _ = ClientToScreen(h, &mut p);
+    let f = *STRIP_FN.lock().unwrap();
+    if let Some(f) = f {
+        f(h.0 as isize, ev, (p.x, p.y));
+    }
+    LRESULT(0)
+}
+
+/// Set the callback for input on tab strips.
+pub fn on_strip_input(f: StripFn) {
+    *STRIP_FN.lock().unwrap() = Some(f);
+}
+
+pub fn create_strip() -> Hwnd {
+    unsafe {
+        let Ok(inst) = GetModuleHandleW(None) else { return 0 };
+        let class = w!("LatticeTabs");
+        let wc = wm::WNDCLASSW {
+            lpfnWndProc: Some(strip_proc),
+            hInstance: inst.into(),
+            lpszClassName: class,
+            hCursor: wm::LoadCursorW(None, wm::IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        // Fails harmlessly once the class exists.
+        wm::RegisterClassW(&wc);
+        let ex = wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE;
+        let Ok(h) = wm::CreateWindowExW(ex, class, w!(""), wm::WS_POPUP, 0, 0, 0, 0, None, None, inst, None) else {
+            return 0;
+        };
+        let round = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            h,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &round as *const _ as *const c_void,
+            std::mem::size_of_val(&round) as u32,
+        );
+        h.0 as isize
+    }
+}
+
+/// What strip `h` shows: its tabs, which one is picked, and whether that
+/// window has the focus. Repaints it.
+pub fn set_strip(h: Hwnd, tabs: Vec<Tab>, active: usize, focused: bool) {
+    let data = StripData { tabs, active, focused, light: light_theme() };
+    {
+        let mut strips = STRIPS.lock().unwrap();
+        match strips.iter_mut().find(|(s, _)| *s == h) {
+            Some((_, d)) => *d = data,
+            None => strips.push((h, data)),
+        }
+    }
+    unsafe {
+        let _ = InvalidateRect(hwnd(h), None, false);
+    }
+}
+
+/// Where each tab of strip `h` is, in its client coordinates.
+fn strip_tab_rects(h: Hwnd) -> Vec<Rect> {
+    let n = STRIPS.lock().unwrap().iter().find(|(s, _)| *s == h).map_or(0, |(_, d)| d.tabs.len());
+    let mut rc = RECT::default();
+    let s = unsafe {
+        let _ = wm::GetClientRect(hwnd(h), &mut rc);
+        GetDpiForWindow(hwnd(h)) as f32 / 96.0
+    };
+    crate::layout::tab_rects(rc.right, rc.bottom, n, (3.0 * s) as i32, (220.0 * s) as i32)
+}
+
+/// Which tab of strip `h` is under screen point `pt`.
+pub fn strip_tab_at(h: Hwnd, pt: (i32, i32)) -> Option<usize> {
+    let mut p = POINT { x: pt.0, y: pt.1 };
+    unsafe {
+        let _ = ScreenToClient(hwnd(h), &mut p);
+    }
+    crate::layout::tab_at(&strip_tab_rects(h), p.x)
+}
+
+/// Show strip `h` at `r`, just above window `owner`, or hide it.
+pub fn place_strip(h: Hwnd, r: Rect, owner: Hwnd, show: bool) {
+    unsafe {
+        if !show {
+            if wm::IsWindowVisible(hwnd(h)).as_bool() {
+                let _ = wm::ShowWindow(hwnd(h), wm::SW_HIDE);
+            }
+            return;
+        }
+        // Stack it right above its window: after whatever is above that.
+        let above = wm::GetWindow(hwnd(owner), wm::GW_HWNDPREV).ok().filter(|p| !p.0.is_null());
+        let mut flags = wm::SWP_NOACTIVATE | wm::SWP_SHOWWINDOW;
+        let after = match above {
+            Some(p) if p == hwnd(h) => {
+                flags |= wm::SWP_NOZORDER;
+                HWND::default()
+            }
+            Some(p) if wm::GetWindowLongW(p, wm::GWL_EXSTYLE) as u32 & wm::WS_EX_TOPMOST.0 == 0 => p,
+            _ => wm::HWND_TOP,
+        };
+        let _ = wm::SetWindowPos(hwnd(h), after, r.x, r.y, r.w, r.h, flags);
+    }
+}
+
+unsafe fn paint_strip(h: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let dc = BeginPaint(h, &mut ps);
+    let mut rc = RECT::default();
+    let _ = wm::GetClientRect(h, &mut rc);
+    let (w, ht) = (rc.right.max(1), rc.bottom.max(1));
+    let mem = CreateCompatibleDC(dc);
+    let bmp = CreateCompatibleBitmap(dc, w, ht);
+    let old = SelectObject(mem, bmp);
+
+    let (tabs, active, focused, light) = match STRIPS.lock().unwrap().iter().find(|(s, _)| *s == h.0 as isize) {
+        Some((_, d)) => (d.tabs.clone(), d.active, d.focused, d.light),
+        None => (vec![], 0, false, false),
+    };
+    // Colours as 0xBBGGRR, after Windows 11's own.
+    let (bg, tab_bg, text, dim, accent) = if light {
+        (0xe8e8e8, 0xffffff, 0x1a1a1a, 0x5c5c5c, 0xb85f00)
+    } else {
+        (0x1c1c1c, 0x383838, 0xffffff, 0xa8a8a8, 0xffc24c)
+    };
+    let fill = |r: RECT, c: u32| {
+        let b = CreateSolidBrush(COLORREF(c));
+        FillRect(mem, &r, b);
+        let _ = DeleteObject(b);
+    };
+    fill(rc, bg);
+
+    let s = GetDpiForWindow(h) as f32 / 96.0;
+    let px = |v: f32| (v * s).round() as i32;
+    let font = CreateFontW(-px(12.0), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
+    let old_font = SelectObject(mem, font);
+    let _ = SetBkMode(mem, TRANSPARENT);
+    let old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
+    for (i, (t, r)) in tabs.iter().zip(strip_tab_rects(h.0 as isize)).enumerate() {
+        let picked = i == active;
+        if picked {
+            let b = CreateSolidBrush(COLORREF(tab_bg));
+            let old_b = SelectObject(mem, b);
+            let rad = px(6.0);
+            let _ = RoundRect(mem, r.x, r.y, r.x + r.w + 1, r.y + r.h + 1, rad, rad);
+            SelectObject(mem, old_b);
+            let _ = DeleteObject(b);
+            if focused {
+                let (lw, lh) = (px(16.0), px(3.0).max(2));
+                let cx = r.x + r.w / 2;
+                fill(RECT { left: cx - lw / 2, top: r.y + r.h - lh, right: cx + lw / 2, bottom: r.y + r.h }, accent);
+            }
+        }
+        let mut x = r.x + px(8.0);
+        let icon = px(16.0);
+        if t.icon != 0 {
+            let _ = wm::DrawIconEx(
+                mem,
+                x,
+                r.y + (r.h - icon) / 2,
+                wm::HICON(t.icon as *mut c_void),
+                icon,
+                icon,
+                0,
+                None,
+                wm::DI_NORMAL,
+            );
+            x += icon + px(8.0);
+        }
+        let _ = SetTextColor(mem, COLORREF(if picked { text } else { dim }));
+        let mut tr = RECT { left: x, top: r.y, right: r.x + r.w - px(8.0), bottom: r.y + r.h };
+        let mut title: Vec<u16> = t.title.encode_utf16().collect();
+        DrawTextW(mem, &mut title, &mut tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | DT_LEFT);
+    }
+    SelectObject(mem, old_pen);
+    SelectObject(mem, old_font);
+    let _ = DeleteObject(font);
+
+    let _ = BitBlt(dc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteDC(mem);
+    let _ = EndPaint(h, &ps);
+}
+
+/// Whether apps are set to the light theme (Settings, Personalization,
+/// Colors).
+fn light_theme() -> bool {
+    let mut v: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut v as *mut u32 as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    r.is_ok() && v != 0
+}
+
+/// A window's title bar text.
+pub fn window_title(h: Hwnd) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { wm::GetWindowTextW(hwnd(h), &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// A window's small icon, or 0. Asks the window, briefly, then its class.
+pub fn window_icon(h: Hwnd) -> isize {
+    unsafe {
+        for kind in [wm::ICON_SMALL2, wm::ICON_SMALL, wm::ICON_BIG] {
+            let mut icon = 0usize;
+            wm::SendMessageTimeoutW(
+                hwnd(h),
+                wm::WM_GETICON,
+                WPARAM(kind as usize),
+                LPARAM(0),
+                wm::SMTO_ABORTIFHUNG,
+                50,
+                Some(&mut icon),
+            );
+            if icon != 0 {
+                return icon as isize;
+            }
+        }
+        for which in [wm::GCLP_HICONSM, wm::GCLP_HICON] {
+            let icon = wm::GetClassLongPtrW(hwnd(h), which);
+            if icon != 0 {
+                return icon as isize;
+            }
+        }
+    }
+    0
+}
+
+/// How much bigger than at 96 DPI display `m` draws things.
+pub fn monitor_scale(m: isize) -> f32 {
+    let (mut x, mut y) = (96u32, 96u32);
+    unsafe {
+        let _ = GetDpiForMonitor(mon(m), MDT_EFFECTIVE_DPI, &mut x, &mut y);
+    }
+    x as f32 / 96.0
+}
+
+pub fn set_foreground(h: Hwnd) {
+    unsafe {
+        let _ = wm::SetForegroundWindow(hwnd(h));
+    }
+}
+
+/// Ask a window to close, as its close button would.
+pub fn close_window(h: Hwnd) {
+    unsafe {
+        let _ = wm::PostMessageW(hwnd(h), wm::WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Rescue: if Lattice ever crashes, no window is left parked off-screen.

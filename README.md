@@ -24,10 +24,18 @@ Lattice lives in the system tray. Right-click the icon to show everything, float
 - Near either end of an edge, it stacks instead: top or bottom of the right edge puts it above or below what's docked on the right, and the ends of the top or bottom edge put it beside what's docked there.
 - Push a window against the middle of the top edge to fill the screen with it. A docked window is framed where it sits; a floating one comes back to where you picked it up when you step out (`Ctrl+Alt+Space`, `Ctrl+Alt+Up` or `Ctrl+Alt+[`).
 - Drop it near the edge of a docked window to split that window's space.
+- Drop it on a docked window's title bar to make them tabs. They share that spot under a strip of tabs, and only the picked one shows. Drop more windows on the strip to add tabs.
 - Drop it in the middle of the screen or of any window and it floats. Drop a docked window there to float it again.
 - Maximized windows drag too: grab the title bar and the window restores under the pointer, as it does with Windows Snap on.
 - Drag the border between two docked windows to resize both at once.
-- Minimize a docked window and its neighbours take the space. Restore it and it comes back to the same spot.
+- Minimize a docked window and its neighbours take the space. Restore it and it comes back to the same spot, tab groups included.
+
+**Tabs**
+
+- Click a tab to show that window. Middle-click a tab to close its window.
+- Drag a tab off the strip to take it out of the group, then drop it anywhere as usual: an edge docks it, the middle floats it, another title bar makes it a tab there. Dragging the showing window by its own title bar does the same.
+- Tabs work with any app, because Lattice only moves windows. It never puts one app's window inside another's.
+- Switching to a hidden tab with Alt+Tab or the taskbar shows it. The same goes for any docked window zoomed out of view: Lattice steps out until it's in view.
 
 **Keyboard**
 
@@ -39,6 +47,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, float
 | `Ctrl+Alt+Enter` | Frame the active window on its own, docked or floating (again to put a floating one back) |
 | `Ctrl+Alt+Left` / `Right` | Move to the neighbouring space |
 | `Ctrl+Alt+[` / `]` | Back / forward |
+| `Ctrl+Alt+Page Up` / `Page Down` | Previous / next tab in the active window's group |
 | `Ctrl+Alt+Shift+Arrow` | Dock the active window at that edge |
 | `Ctrl+Alt+F` | Float or dock the active window |
 | `Ctrl+Alt+Shift+Q` | Quit |
@@ -53,7 +62,7 @@ Each display keeps its own arrangement and camera.
 
 ## How it works
 
-- `src/layout.rs` is the layout engine. It's pure Rust with no Windows code, and unit-tested. The desktop is a tree: leaves are windows, splits divide space by weight. The camera is a path into the tree, and zooming maps that node's rect onto the screen. Windows outside it land off-screen and are parked.
+- `src/layout.rs` is the layout engine. It's pure Rust with no Windows code, and unit-tested. The desktop is a tree: leaves are windows, splits divide space by weight. The camera is a path into the tree, and zooming maps that node's rect onto the screen. Windows outside it land off-screen and are parked. A leaf can hold a tab group: the tree holds the showing tab, and the rest are parked behind it.
 - `src/win/` is the Windows layer. It hooks window events (`SetWinEventHook`) for drags, minimizes and closes, registers global hotkeys, and moves windows with async `SetWindowPos`, so a hung app can never freeze Lattice. Placement accounts for the invisible resize borders on Windows 10/11, so gaps are exact.
 
 ```powershell
@@ -64,7 +73,6 @@ cargo test   # layout engine tests, runs on any OS
 
 - Zoomed-out view with live DWM thumbnails, plus app colour and icon for windows too small to read
 - Pinch-to-zoom on precision touchpads
-- Tab groups (stack windows under one strip)
 - Saved views (`Ctrl+Alt+Shift+1–9` to save, `Ctrl+Alt+1–9` to recall)
 - Persist arrangements across restarts
 - Per-app rules ("don't arrange this app")

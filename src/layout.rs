@@ -7,6 +7,9 @@
 //!
 //! The "camera" is a path into the tree: the node currently shown full-screen.
 //! Zooming in narrows the camera to a deeper node; zooming out widens it.
+//!
+//! A leaf can also hold a group of windows as tabs: they share the leaf's
+//! space under a strip of tabs, and only the one picked shows.
 
 pub type WinId = isize;
 
@@ -18,6 +21,10 @@ const CORNER: f32 = 0.25;
 /// docks it takes half the display, and the other half is this, waiting
 /// for the next window. (0 is never a real window handle.)
 pub const EMPTY: WinId = 0;
+
+/// How far down a window, from its top, a drop puts it in a tab group with
+/// that window rather than docking against its top: about a title bar.
+const TITLE_ZONE: i32 = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -89,6 +96,23 @@ pub struct Placement {
     /// How many levels above the anchor leaf the docking node is.
     up: usize,
     edge: Edge,
+    /// It was a tab in the anchor's group.
+    tab: bool,
+}
+
+/// Windows sharing one leaf as tabs, in strip order. The tree's leaf holds
+/// the one showing; the others wait, parked, behind it. A group always has
+/// at least two windows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    pub wins: Vec<WinId>,
+    pub active: usize,
+}
+
+impl Group {
+    pub fn shown(&self) -> WinId {
+        self.wins[self.active]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,18 +250,105 @@ pub struct Layout {
     pub camera: Vec<usize>,
     /// Gap between windows, in pixels.
     pub gap: i32,
+    /// Height of a tab group's strip of tabs, in pixels.
+    pub tab_bar: i32,
     /// Back/forward history of camera positions.
     back: Vec<Vec<usize>>,
     forward: Vec<Vec<usize>>,
+    groups: Vec<Group>,
 }
 
 impl Layout {
     pub fn new(gap: i32) -> Self {
-        Self { gap, ..Default::default() }
+        Self { gap, tab_bar: 32, ..Default::default() }
     }
 
     pub fn contains(&self, id: WinId) -> bool {
-        id != EMPTY && self.root.as_ref().is_some_and(|r| r.contains(id))
+        id != EMPTY && (self.group_of(id).is_some() || self.root.as_ref().is_some_and(|r| r.contains(id)))
+    }
+
+    /// Every tab group.
+    pub fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    fn group_of(&self, id: WinId) -> Option<usize> {
+        self.groups.iter().position(|g| g.wins.contains(&id))
+    }
+
+    /// The tab group `id` is in, if any.
+    pub fn group(&self, id: WinId) -> Option<&Group> {
+        self.group_of(id).map(|g| &self.groups[g])
+    }
+
+    /// The leaf standing for `id` in the tree: the tab showing in its
+    /// group, or `id` itself.
+    fn leaf_of(&self, id: WinId) -> WinId {
+        self.group(id).map_or(id, Group::shown)
+    }
+
+    fn path_of(&self, id: WinId) -> Option<Vec<usize>> {
+        self.root.as_ref().filter(|_| id != EMPTY)?.path_to(self.leaf_of(id))
+    }
+
+    /// Put `new` in the tree where leaf `old` is.
+    fn swap_leaf(&mut self, old: WinId, new: WinId) {
+        let Some(root) = self.root.as_mut() else { return };
+        if let Some(path) = root.path_to(old) {
+            *node_mut(root, &path).expect("path just found") = Node::Leaf(new);
+        }
+    }
+
+    /// Add `id` as a tab in `onto`'s spot, after the tabs already there, and
+    /// show it. `onto` must be docked; `id` leaves wherever it was.
+    pub fn tab(&mut self, id: WinId, onto: WinId) -> bool {
+        if id == onto || id == EMPTY || !self.contains(onto) {
+            return false;
+        }
+        self.remove(id);
+        let leaf = self.leaf_of(onto);
+        let g = self.group_of(onto).unwrap_or_else(|| {
+            self.groups.push(Group { wins: vec![onto], active: 0 });
+            self.groups.len() - 1
+        });
+        let group = &mut self.groups[g];
+        group.wins.push(id);
+        group.active = group.wins.len() - 1;
+        self.swap_leaf(leaf, id);
+        true
+    }
+
+    /// Show tab `id` in its group. False if it already shows, or isn't a tab.
+    pub fn select(&mut self, id: WinId) -> bool {
+        let Some(g) = self.group_of(id) else { return false };
+        let old = self.groups[g].shown();
+        if old == id {
+            return false;
+        }
+        self.groups[g].active = self.groups[g].wins.iter().position(|&w| w == id).expect("in group");
+        self.swap_leaf(old, id);
+        true
+    }
+
+    /// The tab after the one showing in `id`'s group (dir = 1), or before
+    /// it (-1), wrapping around.
+    pub fn tab_beside(&self, id: WinId, dir: i32) -> Option<WinId> {
+        let g = self.group(id)?;
+        Some(g.wins[(g.active as i32 + dir).rem_euclid(g.wins.len() as i32) as usize])
+    }
+
+    /// Bring `id` into view: show its tab, and step the camera out until it
+    /// takes in `id`. True if anything changed.
+    pub fn reveal(&mut self, id: WinId) -> bool {
+        let mut changed = self.select(id);
+        if let Some(path) = self.path_of(id) {
+            if !path.starts_with(&self.camera) {
+                let common = self.camera.iter().zip(&path).take_while(|(a, b)| a == b).count();
+                self.move_camera(self.camera[..common].to_vec());
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn is_empty(&self) -> bool {
@@ -274,9 +385,8 @@ impl Layout {
             *node_mut(root, &path).expect("valid empty path") = new;
             return;
         }
-        let root = self.root.as_mut().expect("root checked above");
         // Find the node to dock against: the target leaf, or the camera node.
-        let path = match target.and_then(|t| root.path_to(t)) {
+        let path = match target.and_then(|t| self.path_of(t)) {
             Some(p) => p,
             None => self.camera.clone(),
         };
@@ -285,6 +395,10 @@ impl Layout {
 
     /// Where `id` sits, as a placement that `restore` can use to put it back.
     pub fn placement_of(&self, id: WinId) -> Option<Placement> {
+        if let Some(g) = self.group(id) {
+            let anchor = *g.wins.iter().find(|&&w| w != id)?;
+            return Some(Placement { anchor, up: 0, edge: Edge::Left, tab: true });
+        }
         let root = self.root.as_ref()?;
         let path = root.path_to(id)?;
         let (&idx, parent) = path.split_last()?;
@@ -301,12 +415,16 @@ impl Layout {
             (Axis::Vertical, true) => Edge::Top,
             (Axis::Vertical, false) => Edge::Bottom,
         };
-        Some(Placement { anchor, up: anchor_depth - path.len(), edge })
+        Some(Placement { anchor, up: anchor_depth - path.len(), edge, tab: false })
     }
 
     /// Put `id` back where a `placement_of` said it was, as best the tree allows.
     pub fn restore(&mut self, id: WinId, p: Placement) {
-        let path = self.root.as_ref().and_then(|r| r.path_to(p.anchor)).map(|mut path| {
+        if p.tab && self.contains(p.anchor) && !self.contains(id) {
+            self.tab(id, p.anchor);
+            return;
+        }
+        let path = self.path_of(p.anchor).map(|mut path| {
             path.truncate(path.len().saturating_sub(p.up));
             path
         });
@@ -349,6 +467,25 @@ impl Layout {
     pub fn remove(&mut self, id: WinId) -> bool {
         if id == EMPTY {
             return false;
+        }
+        // A tab leaves its group; the tree only changes if it was showing,
+        // and then the tab next to it takes its place.
+        if let Some(g) = self.group_of(id) {
+            let group = &mut self.groups[g];
+            let shown = group.shown() == id;
+            let i = group.wins.iter().position(|&w| w == id).expect("in group");
+            group.wins.remove(i);
+            if i < group.active || group.active == group.wins.len() {
+                group.active -= 1;
+            }
+            let next = group.shown();
+            if group.wins.len() < 2 {
+                self.groups.remove(g);
+            }
+            if shown {
+                self.swap_leaf(id, next);
+            }
+            return true;
         }
         let Some(root) = self.root.as_mut() else { return false };
         let found = if matches!(root, Node::Leaf(w) if *w == id) {
@@ -396,10 +533,27 @@ impl Layout {
     /// Rects for every window, given the display's work area. Windows inside
     /// the camera fill `area`; windows outside it are laid out as if the
     /// whole tree were scaled up around the camera, so they land off-screen.
+    ///
+    /// Every tab in a group gets the group's spot below its strip of tabs.
     pub fn layout(&self, area: Rect) -> Vec<(WinId, Rect)> {
-        let mut out = self.layout_with_empty(area);
-        out.retain(|(w, _)| *w != EMPTY);
+        let mut out = Vec::new();
+        for (id, r) in self.layout_with_empty(area) {
+            match self.group(id) {
+                Some(g) => {
+                    let below = Rect::new(r.x, r.y + self.tab_bar, r.w, (r.h - self.tab_bar).max(1));
+                    out.extend(g.wins.iter().map(|&w| (w, below)));
+                }
+                None if id != EMPTY => out.push((id, r)),
+                None => {}
+            }
+        }
         out
+    }
+
+    /// The whole spot `id` sits in, its group's strip of tabs included.
+    pub fn slot(&self, id: WinId, area: Rect) -> Option<Rect> {
+        let leaf = self.leaf_of(id);
+        self.layout_with_empty(area).into_iter().find(|(w, _)| *w == leaf).map(|(_, r)| r)
     }
 
     /// Like `layout`, but including the rect of the empty space, if any.
@@ -454,7 +608,7 @@ impl Layout {
     /// Frame the smallest node containing `id` that isn't just the leaf itself:
     /// one step deeper toward the window.
     pub fn zoom_in_toward(&mut self, id: WinId) {
-        let Some(path) = self.root.as_ref().filter(|_| id != EMPTY).and_then(|r| r.path_to(id)) else { return };
+        let Some(path) = self.path_of(id) else { return };
         if path.len() > self.camera.len() && path.starts_with(&self.camera) {
             let next = path[..self.camera.len() + 1].to_vec();
             self.move_camera(next);
@@ -463,7 +617,7 @@ impl Layout {
 
     /// Frame a single window on its own.
     pub fn frame(&mut self, id: WinId) {
-        if let Some(p) = self.root.as_ref().filter(|_| id != EMPTY).and_then(|r| r.path_to(id)) {
+        if let Some(p) = self.path_of(id) {
             self.move_camera(p);
         }
     }
@@ -592,8 +746,9 @@ impl Layout {
         py: i32,
         exclude: WinId,
     ) -> Option<(Option<WinId>, Edge)> {
-        // The middle of the top fills the display rather than docking.
-        if fullscreen_drop(area, px, py) {
+        // The middle of the top fills the display, and a title bar makes
+        // tabs, rather than docking.
+        if fullscreen_drop(area, px, py) || self.tab_target(area, px, py, exclude).is_some() {
             return None;
         }
         if let Some(edge) = screen_edge(area, px, py) {
@@ -623,6 +778,22 @@ impl Layout {
             return Some((Some(id), edge));
         }
         None
+    }
+
+    /// The window whose spot a drop at (px, py) would join as a tab, for
+    /// drag-to-tab: dropped on a docked window's title bar, or on its
+    /// group's strip of tabs. `exclude` is the window being dragged.
+    pub fn tab_target(&self, area: Rect, px: i32, py: i32, exclude: WinId) -> Option<WinId> {
+        if fullscreen_drop(area, px, py) || screen_edge(area, px, py).is_some() {
+            return None;
+        }
+        let (id, r) = self
+            .layout_with_empty(area)
+            .into_iter()
+            .find(|(id, r)| *id != EMPTY && r.contains(px, py))?;
+        let bar = if self.group_of(id).is_some() { self.tab_bar } else { 0 };
+        let zone = bar + TITLE_ZONE.min(edge_reach(r.h - bar) / 2);
+        (id != exclude && py < r.y + zone).then_some(id)
     }
 
     /// For a drop at the display's `edge` near one end of that side, the
@@ -682,6 +853,33 @@ impl Layout {
         l.dock(id, edge, target);
         l.layout(area).into_iter().find(|(w, _)| *w == id).map(|(_, r)| r)
     }
+}
+
+/// The band for a strip of tabs, `bar` tall, over a group's window at `win`.
+pub fn tab_bar_over(win: Rect, bar: i32) -> Rect {
+    Rect::new(win.x, win.y - bar, win.w, bar)
+}
+
+/// Where each of `n` tabs sits in a strip `w`×`h` (in the strip's own
+/// coordinates): equal widths up to `max`, from the left, `pad` apart and
+/// in from the strip's ends.
+pub fn tab_rects(w: i32, h: i32, n: usize, pad: i32, max: i32) -> Vec<Rect> {
+    if n == 0 {
+        return vec![];
+    }
+    let room = w - pad * (n as i32 + 1);
+    let each = (room / n as i32).clamp(1, max);
+    (0..n as i32).map(|i| Rect::new(pad + i * (each + pad), pad, each, (h - 2 * pad).max(1))).collect()
+}
+
+/// Which tab of a strip laid out by `tab_rects` is at `x`; the gaps go to
+/// the tab on their left.
+pub fn tab_at(tabs: &[Rect], x: i32) -> Option<usize> {
+    let last = tabs.last()?;
+    if x < 0 || x >= last.x + last.w {
+        return None;
+    }
+    Some(tabs.iter().rposition(|t| x >= t.x - 1).unwrap_or(0))
 }
 
 /// Whether a drop at (px, py) fills the display: pressed against the top,
@@ -1056,6 +1254,155 @@ mod tests {
             b.sort_by_key(|x| x.0);
             assert_eq!(a, b, "window {id} did not come back to its spot");
         }
+    }
+
+    /// Windows 1 and 2 side by side, then 3 dropped on 2 as a tab.
+    fn tabbed() -> Layout {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        assert!(l.tab(3, 2));
+        l
+    }
+
+    #[test]
+    fn tabs_share_a_spot_under_the_strip() {
+        let l = tabbed();
+        let under = Rect::new(500, 32, 500, 568);
+        assert_eq!(rect_of(&l, 2), under);
+        assert_eq!(rect_of(&l, 3), under);
+        assert_eq!(rect_of(&l, 1), Rect::new(0, 0, 500, 600), "the neighbour keeps its space");
+        assert!(l.is_visible(3) && !l.is_visible(2), "the new tab shows");
+        assert_eq!(tab_bar_over(under, l.tab_bar), Rect::new(500, 0, 500, 32));
+        assert_eq!(l.slot(2, AREA), Some(Rect::new(500, 0, 500, 600)));
+        assert_eq!(l.group(2).unwrap().wins, vec![2, 3]);
+        assert!(l.contains(2) && l.contains(3));
+    }
+
+    #[test]
+    fn switching_tabs() {
+        let mut l = tabbed();
+        assert!(l.select(2));
+        assert!(l.is_visible(2) && !l.is_visible(3));
+        assert!(!l.select(2), "already showing");
+        assert!(!l.select(1), "not a tab");
+        assert_eq!(l.tab_beside(2, 1), Some(3));
+        l.select(3);
+        assert_eq!(l.tab_beside(3, 1), Some(2), "wraps around");
+        assert_eq!(l.tab_beside(3, -1), Some(2));
+        assert_eq!(l.tab_beside(1, 1), None);
+    }
+
+    #[test]
+    fn closing_tabs_shows_the_next_and_ends_the_group() {
+        let mut l = tabbed();
+        l.tab(4, 3);
+        l.select(3);
+        assert!(l.remove(3));
+        assert!(l.is_visible(4), "the tab after it takes over");
+        assert_eq!(l.group(2).unwrap().wins, vec![2, 4]);
+        assert!(l.remove(4));
+        assert!(l.group(2).is_none(), "one window left is no group");
+        assert_eq!(rect_of(&l, 2), Rect::new(500, 0, 500, 600), "and gets the strip's space back");
+        assert!(l.is_visible(2));
+    }
+
+    #[test]
+    fn closing_the_last_tab_shows_the_one_before() {
+        let mut l = tabbed();
+        l.tab(4, 2);
+        assert!(l.remove(4));
+        assert!(l.is_visible(3));
+        assert_eq!(l.group(2).unwrap().active, 1);
+    }
+
+    #[test]
+    fn a_tab_can_move_to_another_group_or_dock() {
+        let mut l = tabbed();
+        l.tab(3, 1);
+        assert_eq!(l.group(1).unwrap().wins, vec![1, 3]);
+        assert!(l.group(2).is_none());
+        l.dock(3, Edge::Bottom, Some(2));
+        assert!(l.group(1).is_none());
+        assert_eq!(rect_of(&l, 3), Rect::new(500, 300, 500, 300));
+    }
+
+    #[test]
+    fn tabbing_the_only_neighbour_collapses_its_split() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        l.tab(2, 1);
+        assert_eq!(rect_of(&l, 1), Rect::new(0, 32, 1000, 568));
+        assert!(l.is_visible(2));
+    }
+
+    #[test]
+    fn a_minimized_tab_comes_back_to_its_group() {
+        let mut l = tabbed();
+        let p = l.placement_of(3).unwrap();
+        l.remove(3);
+        l.restore(3, p);
+        assert_eq!(l.group(2).unwrap().wins, vec![2, 3]);
+        assert!(l.is_visible(3));
+    }
+
+    #[test]
+    fn camera_and_docking_follow_the_showing_tab() {
+        let mut l = tabbed();
+        l.frame(2);
+        assert_eq!(l.slot(3, AREA), Some(AREA), "framing a hidden tab frames its group");
+        l.zoom_all();
+        l.dock(4, Edge::Bottom, Some(2));
+        assert_eq!(rect_of(&l, 4), Rect::new(500, 300, 500, 300));
+        assert_eq!(l.slot(3, AREA), Some(Rect::new(500, 0, 500, 300)));
+    }
+
+    #[test]
+    fn reveal_shows_the_tab_and_steps_out_to_it() {
+        let mut l = tabbed();
+        l.frame(1);
+        assert!(l.reveal(2));
+        assert!(l.is_visible(2) && l.camera.is_empty());
+        assert!(!l.reveal(2), "already in view");
+        assert!(!l.reveal(1));
+    }
+
+    #[test]
+    fn title_bars_and_strips_take_tabs() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        // Window 2's title bar, away from the screen's edges.
+        assert_eq!(l.tab_target(AREA, 700, 20, 9), Some(2));
+        assert_eq!(l.dock_target(AREA, 700, 20, 9), None, "not a dock");
+        assert_eq!(l.tab_target(AREA, 700, 20, 2), None, "not onto itself");
+        // Just below it still docks against its top.
+        assert_eq!(l.tab_target(AREA, 700, 70, 9), None);
+        assert_eq!(l.dock_target(AREA, 700, 70, 9), Some((Some(2), Edge::Top)));
+        // A screen edge wins.
+        assert_eq!(l.tab_target(AREA, 2, 20, 9), None);
+        // A group's strip and the title bar under it both count.
+        l.tab(3, 2);
+        assert_eq!(l.tab_target(AREA, 700, 60, 9), Some(3));
+        assert_eq!(l.tab_target(AREA, 700, 90, 9), None);
+        // Nothing to tab with in the empty space.
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        assert_eq!(l.tab_target(AREA, 700, 20, 9), None);
+    }
+
+    #[test]
+    fn tab_strip_geometry() {
+        let tabs = tab_rects(500, 30, 2, 4, 200);
+        assert_eq!(tabs, vec![Rect::new(4, 4, 200, 22), Rect::new(208, 4, 200, 22)]);
+        let narrow = tab_rects(100, 30, 3, 4, 200);
+        assert_eq!(narrow[2].x + narrow[2].w, 4 + 3 * 28 + 2 * 4);
+        assert_eq!(tab_at(&tabs, 10), Some(0));
+        assert_eq!(tab_at(&tabs, 206), Some(0), "gap goes left");
+        assert_eq!(tab_at(&tabs, 300), Some(1));
+        assert_eq!(tab_at(&tabs, 450), None, "past the last tab");
+        assert_eq!(tab_at(&[], 10), None);
     }
 
     #[test]
