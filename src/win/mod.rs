@@ -88,7 +88,7 @@ enum Cmd {
 }
 
 const HOTKEYS: [(Cmd, Mods, u32, &str); 14] = [
-    (Cmd::ShowAll, Mods::CtrlAlt, VK_0, "Ctrl+Alt+0  show everything"),
+    (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::ZoomOut, Mods::CtrlAlt, VK_UP, "Ctrl+Alt+Up  step out a level"),
     (Cmd::ZoomIn, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  step in toward the pointer"),
     (Cmd::Frame, Mods::CtrlAlt, VK_RETURN, "Ctrl+Alt+Enter  frame a window on its own"),

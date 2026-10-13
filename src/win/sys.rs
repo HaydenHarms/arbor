@@ -31,7 +31,7 @@ pub use wm::{
 };
 pub const WM_TRAY: u32 = wm::WM_APP + 1;
 
-pub const VK_0: u32 = 0x30;
+pub const VK_SPACE: u32 = 0x20;
 pub const VK_RETURN: u32 = 0x0D;
 pub const VK_LEFT: u32 = 0x25;
 pub const VK_UP: u32 = 0x26;
