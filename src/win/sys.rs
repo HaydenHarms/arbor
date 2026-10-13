@@ -6,14 +6,16 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
-use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTONULL,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW, MonitorFromPoint,
+    MonitorFromWindow, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, SRCCOPY,
 };
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
@@ -420,6 +422,135 @@ pub fn park_window(h: Hwnd) {
 }
 
 // ---------------------------------------------------------------------------
+// Drop-zone overlay: a frosted panel marking where a dragged window will
+// dock. It sits just under the dragged window, above everything else, and
+// never takes the mouse. Windows only blurs behind *active* windows, so the
+// frost is done by hand: capture the screen under the zone (the panel is
+// excluded from capture), blur it in `crate::frost`, and show the result.
+
+unsafe extern "system" fn overlay_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    wm::DefWindowProcW(h, msg, wp, lp)
+}
+
+pub fn create_overlay() -> Hwnd {
+    unsafe {
+        let Ok(inst) = GetModuleHandleW(None) else { return 0 };
+        let class = w!("LatticeDropZone");
+        let wc = wm::WNDCLASSW {
+            lpfnWndProc: Some(overlay_proc),
+            hInstance: inst.into(),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        wm::RegisterClassW(&wc);
+        // Layered + transparent: per-pixel alpha, and clicks pass through.
+        let ex = wm::WS_EX_LAYERED | wm::WS_EX_TRANSPARENT | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE;
+        let Ok(h) = wm::CreateWindowExW(ex, class, w!(""), wm::WS_POPUP, 0, 0, 0, 0, None, None, inst, None) else {
+            return 0;
+        };
+        // Keep it out of screen captures, including our own, so capturing
+        // what's under it never sees it.
+        let _ = wm::SetWindowDisplayAffinity(h, wm::WDA_EXCLUDEFROMCAPTURE);
+        h.0 as isize
+    }
+}
+
+/// The screen inside `r`, shrunk to sw×sh with averaging, as 0xAARRGGBB.
+pub fn capture_scaled(r: Rect, sw: usize, sh: usize) -> Vec<u32> {
+    let mut out = vec![0u32; sw * sh];
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        let (bmp, bits) = dib(screen, sw, sh);
+        if let Some(bmp) = bmp {
+            let old = SelectObject(mem, bmp);
+            SetStretchBltMode(mem, HALFTONE);
+            let _ = StretchBlt(mem, 0, 0, sw as i32, sh as i32, screen, r.x, r.y, r.w, r.h, SRCCOPY);
+            std::ptr::copy_nonoverlapping(bits as *const u32, out.as_mut_ptr(), sw * sh);
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+        }
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+    }
+    out
+}
+
+/// A top-down 32-bit DIB section of w×h, and a pointer to its pixels.
+unsafe fn dib(dc: HDC, w: usize, h: usize) -> (Option<HBITMAP>, *mut c_void) {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let bmp = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok();
+    (bmp.filter(|_| !bits.is_null()), bits)
+}
+
+/// Show premultiplied 0xAARRGGBB `pixels` (r.w×r.h) at `r`, just beneath
+/// window `below`.
+pub fn show_overlay(h: Hwnd, r: Rect, pixels: &[u32], below: Hwnd) {
+    let (w, ht) = (r.w.max(1) as usize, r.h.max(1) as usize);
+    if pixels.len() != w * ht {
+        return;
+    }
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        let (bmp, bits) = dib(screen, w, ht);
+        if let Some(bmp) = bmp {
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, w * ht);
+            let old = SelectObject(mem, bmp);
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+                ..Default::default()
+            };
+            let _ = wm::UpdateLayeredWindow(
+                hwnd(h),
+                screen,
+                Some(&POINT { x: r.x, y: r.y }),
+                Some(&SIZE { cx: r.w, cy: r.h }),
+                mem,
+                Some(&POINT::default()),
+                COLORREF(0),
+                Some(&blend),
+                wm::ULW_ALPHA,
+            );
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+        }
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        let _ = wm::SetWindowPos(
+            hwnd(h),
+            hwnd(below),
+            0,
+            0,
+            0,
+            0,
+            wm::SWP_NOMOVE | wm::SWP_NOSIZE | wm::SWP_NOACTIVATE | wm::SWP_SHOWWINDOW,
+        );
+    }
+}
+
+pub fn hide_overlay(h: Hwnd) {
+    unsafe {
+        let _ = wm::ShowWindow(hwnd(h), wm::SW_HIDE);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Rescue: if Lattice ever crashes, no window is left parked off-screen.
 
 static RESCUE: Mutex<Vec<Hwnd>> = Mutex::new(Vec::new());
@@ -474,7 +605,3 @@ pub fn install_rescue_hook() {
         prev(info);
     }));
 }
-
-// Silence unused-import warnings on BOOL in some windows-rs versions.
-#[allow(dead_code)]
-fn _unused(_: BOOL) {}

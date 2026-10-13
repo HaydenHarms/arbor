@@ -3,6 +3,7 @@
 
 mod sys;
 
+use crate::frost;
 use crate::layout::{ease, Edge, Layout, Placement, Rect, WinId};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -13,6 +14,23 @@ use sys::*;
 const MOTION: Duration = Duration::from_millis(240);
 const GAP: i32 = 8;
 const ANIM_TIMER: usize = 1;
+/// Updates the drop zone while a window is being dragged.
+const DRAG_TIMER: usize = 2;
+
+/// How the drop zone looks: frosted glass, a touch darker than what's under it.
+const ZONE_STYLE: frost::Style = frost::Style { blur: 2, darken: 40, corner: 10.0, border: 60 };
+/// The drop zone's frost is captured at 1/ZONE_SCALE size, then blurred.
+const ZONE_SCALE: i32 = 8;
+/// How often the frost is redrawn while the zone stays put.
+const ZONE_REFRESH: Duration = Duration::from_millis(100);
+
+/// The screen under `r`, frosted.
+fn frosted(r: Rect) -> Vec<u32> {
+    let (sw, sh) = ((r.w / ZONE_SCALE).max(1) as usize, (r.h / ZONE_SCALE).max(1) as usize);
+    let mut small = capture_scaled(r, sw, sh);
+    frost::blur(&mut small, sw, sh, ZONE_STYLE.blur);
+    frost::compose(&small, sw, sh, r.w.max(1) as usize, r.h.max(1) as usize, &ZONE_STYLE)
+}
 
 type MonId = isize;
 
@@ -31,6 +49,12 @@ struct App {
     /// Visual rect of a window when a user drag began.
     drag_start: HashMap<WinId, Rect>,
     anim: Option<Anim>,
+    /// The drop-zone panel, where it's showing (None = hidden), when it was
+    /// last drawn, and the window being dragged, which it sits just under.
+    overlay: Hwnd,
+    drop_zone: Option<Rect>,
+    zone_drawn: Option<Instant>,
+    dragging: Hwnd,
 }
 
 thread_local! {
@@ -80,7 +104,11 @@ pub fn run() {
     trace!("started; hotkeys taken: {failed:?}");
     add_tray_icon(hwnd, "Lattice: dock, nest and zoom your windows");
     install_event_hooks(on_win_event);
-    with_app(|app| app.hwnd = hwnd);
+    let overlay = create_overlay();
+    with_app(|app| {
+        app.hwnd = hwnd;
+        app.overlay = overlay;
+    });
     if !failed.is_empty() {
         message_box(
             "Lattice",
@@ -144,6 +172,10 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
         }
         WM_TIMER if wparam == ANIM_TIMER => {
             with_app(|app| app.tick());
+            Some(0)
+        }
+        WM_TIMER if wparam == DRAG_TIMER => {
+            with_app(|app| app.drag_tick());
             Some(0)
         }
         WM_TRAY => {
@@ -226,11 +258,16 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
         EVENT_SYSTEM_MOVESIZESTART => {
             if let Some(r) = visual_rect(hwnd) {
                 app.drag_start.insert(hwnd, r);
+                set_timer(app.hwnd, DRAG_TIMER, 16);
             }
             // A drag interrupts any motion in flight.
             app.finish_anim();
         }
-        EVENT_SYSTEM_MOVESIZEEND => app.drag_ended(hwnd),
+        EVENT_SYSTEM_MOVESIZEEND => {
+            kill_timer(app.hwnd, DRAG_TIMER);
+            app.show_drop_zone(None);
+            app.drag_ended(hwnd);
+        }
         EVENT_SYSTEM_MINIMIZESTART => {
             if let Some(m) = app.monitor_of(hwnd) {
                 if let Some(p) = app.layouts[&m].placement_of(hwnd) {
@@ -283,6 +320,60 @@ impl App {
         }
     }
 
+    /// Where a window being dragged would dock if dropped now: the display,
+    /// and the target and edge to pass to `dock`. None means it would float.
+    fn drop_target(&self, hwnd: Hwnd, pt: (i32, i32)) -> Option<(MonId, Option<WinId>, Edge)> {
+        if !is_manageable(hwnd) {
+            return None;
+        }
+        let mon = monitor_at(pt);
+        let area = work_area(mon);
+        let target = match self.layouts.get(&mon) {
+            Some(l) => l.dock_target(area, pt.0, pt.1, hwnd),
+            None => Layout::new(GAP).dock_target(area, pt.0, pt.1, hwnd),
+        };
+        target.map(|(target, edge)| (mon, target, edge))
+    }
+
+    /// While a window is being dragged by its title bar, show where it
+    /// would dock if dropped now.
+    fn drag_tick(&mut self) {
+        let Some((&hwnd, &start)) = self.drag_start.iter().next() else {
+            self.show_drop_zone(None);
+            return;
+        };
+        self.dragging = hwnd;
+        let Some(now) = visual_rect(hwnd) else { return };
+        let resizing = (now.w - start.w).abs() > 2 || (now.h - start.h).abs() > 2;
+        let zone = if resizing {
+            None
+        } else {
+            self.drop_target(hwnd, cursor_pos()).and_then(|(mon, target, edge)| {
+                let area = work_area(mon);
+                let l = self.layouts.get(&mon).cloned().unwrap_or_else(|| Layout::new(GAP));
+                l.preview(hwnd, edge, target, area)
+            })
+        };
+        self.show_drop_zone(zone);
+    }
+
+    fn show_drop_zone(&mut self, zone: Option<Rect>) {
+        // Redraw when the zone moves, and every so often while it stays put,
+        // so the frost keeps up with what's underneath.
+        let stale = self.zone_drawn.is_none_or(|t| t.elapsed() >= ZONE_REFRESH);
+        if zone == self.drop_zone && (zone.is_none() || !stale) {
+            return;
+        }
+        self.drop_zone = zone;
+        match zone {
+            Some(r) => {
+                self.zone_drawn = Some(Instant::now());
+                show_overlay(self.overlay, r, &frosted(r), self.dragging);
+            }
+            None => hide_overlay(self.overlay),
+        }
+    }
+
     fn drag_ended(&mut self, hwnd: Hwnd) {
         let Some(start) = self.drag_start.remove(&hwnd) else { return };
         let Some(now) = visual_rect(hwnd) else { return };
@@ -304,16 +395,10 @@ impl App {
         }
 
         // Dragged the title bar: dock where it was dropped, or float it.
-        let mon = monitor_at(pt);
-        let area = work_area(mon);
-        let target = match self.layouts.get(&mon) {
-            Some(l) => l.dock_target(area, pt.0, pt.1, now, hwnd),
-            // An empty display docks the first window at any edge.
-            None => Layout::new(GAP).dock_target(area, pt.0, pt.1, now, hwnd),
-        };
-        trace!("dock target {target:?} in {area:?}, manageable {}", is_manageable(hwnd));
-        match target {
-            Some((target, edge)) if is_manageable(hwnd) => {
+        let drop = self.drop_target(hwnd, pt);
+        trace!("drop target {drop:?}");
+        match drop {
+            Some((mon, target, edge)) => {
                 if let Some(old) = docked_on {
                     self.undock(hwnd);
                     if old != mon {

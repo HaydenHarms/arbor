@@ -30,3 +30,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Lattice redraws windows and the drop zone every frame; keep debug builds
+# smooth enough to test with.
+[profile.dev]
+opt-level = 1

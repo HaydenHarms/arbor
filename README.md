@@ -19,9 +19,11 @@ Lattice lives in the system tray. Right-click the icon to show everything, float
 
 **Docking with the mouse**
 
-- Drag a window by its title bar to a screen edge to dock it beside everything in view. Pushing the window partly off the left or right side works too.
-- Drag it onto the edge of another docked window to split that window's space.
-- Drop a docked window away from any edge to float it again.
+- While you drag, a frosted panel shows exactly where the window will land. No panel means it will float where you drop it.
+- Drag a window by its title bar until the pointer meets a screen edge to dock it there. The first window takes that half of the screen; the next fills the other half.
+- Near either end of an edge, it stacks instead: top or bottom of the right edge puts it above or below what's docked on the right, and the ends of the top or bottom edge put it beside what's docked there.
+- Drop it near the edge of a docked window to split that window's space.
+- Drop it in the middle of the screen or of any window and it floats. Drop a docked window there to float it again.
 - Drag the border between two docked windows to resize both at once.
 - Minimize a docked window and its neighbours take the space. Restore it and it comes back to the same spot.
 

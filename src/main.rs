@@ -2,6 +2,8 @@
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod frost;
 #[cfg(windows)]
 mod win;
 

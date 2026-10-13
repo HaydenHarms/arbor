@@ -10,8 +10,9 @@
 
 pub type WinId = isize;
 
-/// How far (px) a dropped window must hang past a side of the display to dock there.
-const OVERHANG: i32 = 16;
+/// The share of a display side, at each end, where a drop stacks against
+/// the window in that corner rather than taking the whole side.
+const CORNER: f32 = 0.25;
 
 /// A leaf holding free space rather than a window. When the first window
 /// docks it takes half the display, and the other half is this, waiting
@@ -577,75 +578,144 @@ impl Layout {
     }
 
     /// Where a window dropped with the pointer at (px, py) should dock, for
-    /// drag-to-dock. `dropped` is where the dragged window `exclude` ended up.
-    /// Returns the window to dock beside (None for the whole view) and which
-    /// of its edges.
+    /// drag-to-dock. `exclude` is the window being dragged.
+    /// Returns the window to dock beside (None for the whole view, `EMPTY`
+    /// to fill the empty space) and which of its edges, or None to leave the
+    /// window floating where it was dropped.
+    ///
+    /// Only edges dock. The middle of the display, and of every window,
+    /// leaves the window floating.
     pub fn dock_target(
         &self,
         area: Rect,
         px: i32,
         py: i32,
-        dropped: Rect,
         exclude: WinId,
     ) -> Option<(Option<WinId>, Edge)> {
-        let band = 48;
-        // The display's own edges dock beside everything in view.
-        if px <= area.x + band {
-            return Some((None, Edge::Left));
-        }
-        if px >= area.x + area.w - band {
-            return Some((None, Edge::Right));
-        }
-        // Top only when the pointer is pressed against it: docked windows'
-        // title bars live up there, and sliding one sideways shouldn't re-dock.
-        if py <= area.y + 2 {
-            return Some((None, Edge::Top));
-        }
-        if py >= area.y + area.h - band {
-            return Some((None, Edge::Bottom));
-        }
-        // Pushing the window itself past the left or right edge counts too:
-        // people grab a title bar mid-way and shove until the window hits the
-        // side, without the pointer ever reaching it. (Not top or bottom:
-        // Windows stops title bars at the top, and tall windows often hang
-        // off the bottom by accident.)
-        let over_left = area.x - dropped.x;
-        let over_right = (dropped.x + dropped.w) - (area.x + area.w);
-        if over_left.max(over_right) >= OVERHANG {
-            let edge = if over_left >= over_right { Edge::Left } else { Edge::Right };
-            return Some((None, edge));
+        if let Some(edge) = screen_edge(area, px, py) {
+            // Near either end of a side, stack against the window in that
+            // corner instead of taking the whole side: top or bottom of a
+            // window docked left or right, beside one docked top or bottom.
+            return Some(self.corner_target(area, edge, px, py, exclude).unwrap_or((None, edge)));
         }
         for (id, r) in self.layout_with_empty(area) {
             if id == exclude || !r.contains(px, py) {
                 continue;
             }
-            // Dropping anywhere in the empty space fills it. The edge is the
-            // side of the display the space lies on, which matters if the
-            // dragged window was the only one docked: then the layout empties
-            // and it docks afresh, against that side.
+            let (reach_x, reach_y) = (edge_reach(r.w), edge_reach(r.h));
+            let edges = [
+                (Edge::Left, px - r.x, reach_x),
+                (Edge::Right, r.x + r.w - 1 - px, reach_x),
+                (Edge::Top, py - r.y, reach_y),
+                (Edge::Bottom, r.y + r.h - 1 - py, reach_y),
+            ];
+            let (edge, ..) = edges
+                .into_iter()
+                .filter(|&(_, d, reach)| d < reach)
+                .min_by(|a, b| (a.1 as f32 / a.2 as f32).total_cmp(&(b.1 as f32 / b.2 as f32)))?;
             if id == EMPTY {
-                let dx = (r.x + r.w / 2 - (area.x + area.w / 2)) as f32 / area.w as f32;
-                let dy = (r.y + r.h / 2 - (area.y + area.h / 2)) as f32 / area.h as f32;
-                let edge = match (dx.abs() >= dy.abs(), dx < 0.0, dy < 0.0) {
-                    (true, true, _) => Edge::Left,
-                    (true, false, _) => Edge::Right,
-                    (false, _, true) => Edge::Top,
-                    (false, _, false) => Edge::Bottom,
-                };
-                return Some((Some(EMPTY), edge));
+                return Some((Some(EMPTY), self.empty_side(area, r)));
             }
-            // Closest edge, measured relative to the window's size so tall
-            // and wide windows behave the same.
-            let fx = (px - r.x) as f32 / r.w as f32;
-            let fy = (py - r.y) as f32 / r.h as f32;
-            let edges = [(Edge::Left, fx), (Edge::Right, 1.0 - fx), (Edge::Top, fy), (Edge::Bottom, 1.0 - fy)];
-            let (edge, d) = edges.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
-            if d < 0.3 {
-                return Some((Some(id), edge));
-            }
+            return Some((Some(id), edge));
         }
         None
     }
+
+    /// For a drop at the display's `edge` near one end of that side, the
+    /// window in that corner and the edge of it to stack against.
+    fn corner_target(&self, area: Rect, edge: Edge, px: i32, py: i32, exclude: WinId) -> Option<(Option<WinId>, Edge)> {
+        // Where along the side the pointer is, 0..1, and the point on the
+        // side to look for a window at.
+        let (along, x, y) = match edge {
+            Edge::Left => ((py - area.y) as f32 / area.h as f32, area.x + 1, py),
+            Edge::Right => ((py - area.y) as f32 / area.h as f32, area.x + area.w - 2, py),
+            Edge::Top => ((px - area.x) as f32 / area.w as f32, px, area.y + 1),
+            Edge::Bottom => ((px - area.x) as f32 / area.w as f32, px, area.y + area.h - 2),
+        };
+        let stack = match (edge.axis(), along) {
+            (Axis::Horizontal, a) if a < CORNER => Edge::Top,
+            (Axis::Horizontal, a) if a > 1.0 - CORNER => Edge::Bottom,
+            (Axis::Vertical, a) if a < CORNER => Edge::Left,
+            (Axis::Vertical, a) if a > 1.0 - CORNER => Edge::Right,
+            _ => return None,
+        };
+        // The gaps between windows can leave the exact point uncovered, so
+        // take the nearest rect there.
+        let (id, r) = self
+            .layout_with_empty(area)
+            .into_iter()
+            .filter(|(id, _)| *id != exclude)
+            .min_by_key(|(_, r)| dist_to_rect(*r, x, y))?;
+        // Only a window actually against that side (the point is on the
+        // side's edge, so near means touching). Empty space there is filled.
+        let touches = dist_to_rect(r, x, y) <= self.gap + 2;
+        match (touches, id) {
+            (false, _) => None,
+            (true, EMPTY) => Some((Some(EMPTY), edge)),
+            (true, id) => Some((Some(id), stack)),
+        }
+    }
+
+    /// The side of the display the empty space `r` lies on. If the dragged
+    /// window was the only one docked, the layout empties when it's lifted
+    /// out and it docks afresh against this side.
+    fn empty_side(&self, area: Rect, r: Rect) -> Edge {
+        let dx = (r.x + r.w / 2 - (area.x + area.w / 2)) as f32 / area.w as f32;
+        let dy = (r.y + r.h / 2 - (area.y + area.h / 2)) as f32 / area.h as f32;
+        match (dx.abs() >= dy.abs(), dx < 0.0, dy < 0.0) {
+            (true, true, _) => Edge::Left,
+            (true, false, _) => Edge::Right,
+            (false, _, true) => Edge::Top,
+            (false, _, false) => Edge::Bottom,
+        }
+    }
+
+    /// Where `id` would land if docked at `edge` of `target` (see `dock`),
+    /// for showing the drop zone before the user lets go.
+    pub fn preview(&self, id: WinId, edge: Edge, target: Option<WinId>, area: Rect) -> Option<Rect> {
+        let mut l = self.clone();
+        l.remove(id);
+        l.dock(id, edge, target);
+        l.layout(area).into_iter().find(|(w, _)| *w == id).map(|(_, r)| r)
+    }
+}
+
+/// Which side of the display a drop at (px, py) docks against, if any.
+///
+/// Only the pointer counts, not how far the window hangs off: wide windows
+/// overhang a side after almost any move, so going by that made them
+/// impossible to float. The drop-zone highlight shows when the pointer is
+/// close enough.
+fn screen_edge(area: Rect, px: i32, py: i32) -> Option<Edge> {
+    let band = 48;
+    if px <= area.x + band {
+        return Some(Edge::Left);
+    }
+    if px >= area.x + area.w - band {
+        return Some(Edge::Right);
+    }
+    // Top only when the pointer is pressed against it: docked windows'
+    // title bars live up there, and sliding one sideways shouldn't re-dock.
+    if py <= area.y + 2 {
+        return Some(Edge::Top);
+    }
+    if py >= area.y + area.h - band {
+        return Some(Edge::Bottom);
+    }
+    None
+}
+
+/// How far in from a window's edge a drop still docks against that edge.
+/// Further in is the middle, where a drop leaves the window floating.
+fn edge_reach(len: i32) -> i32 {
+    (len as f32 * 0.2).min(160.0) as i32
+}
+
+/// Manhattan distance from a point to a rect, 0 inside it.
+fn dist_to_rect(r: Rect, x: i32, y: i32) -> i32 {
+    let dx = (r.x - x).max(x - (r.x + r.w - 1)).max(0);
+    let dy = (r.y - y).max(y - (r.y + r.h - 1)).max(0);
+    dx + dy
 }
 
 fn node_mut<'a>(node: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
@@ -691,7 +761,7 @@ mod tests {
         // Dropped into the empty space.
         let mut l = Layout::new(0);
         l.dock(1, Edge::Right, None);
-        let target = l.dock_target(AREA, 200, 300, Rect::new(100, 100, 300, 300), 2);
+        let target = l.dock_target(AREA, 450, 300, 2);
         assert_eq!(target, Some((Some(EMPTY), Edge::Left)));
         l.dock(2, Edge::Left, Some(EMPTY));
         assert_eq!(rect_of(&l, 2), Rect::new(0, 0, 500, 600));
@@ -702,7 +772,7 @@ mod tests {
     fn lone_window_dragged_into_empty_half_moves_there() {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
-        let (target, edge) = l.dock_target(AREA, 800, 300, Rect::new(600, 100, 300, 300), 1).unwrap();
+        let (target, edge) = l.dock_target(AREA, 520, 300, 1).unwrap();
         assert_eq!((target, edge), (Some(EMPTY), Edge::Right));
         // The app undocks the window first, then docks it at the drop.
         l.remove(1);
@@ -746,11 +816,61 @@ mod tests {
     }
 
     #[test]
+    fn middle_of_a_window_or_the_empty_space_floats() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        assert_eq!(l.dock_target(AREA, 250, 300, 9), None, "middle of window 1");
+        assert_eq!(l.dock_target(AREA, 750, 300, 9), None, "middle of the empty half");
+    }
+
+    #[test]
+    fn side_corners_stack_in_that_column() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        // Top of the right side: on top of window 2.
+        let (t, e) = l.dock_target(AREA, 998, 50, 3).unwrap();
+        assert_eq!((t, e), (Some(2), Edge::Top));
+        assert_eq!(l.preview(3, e, t, AREA), Some(Rect::new(500, 0, 500, 300)));
+        // Bottom of the left side: under window 1.
+        assert_eq!(l.dock_target(AREA, 2, 580, 3), Some((Some(1), Edge::Bottom)));
+        // Middle of a side still takes the whole side.
+        assert_eq!(l.dock_target(AREA, 998, 300, 3), Some((None, Edge::Right)));
+    }
+
+    #[test]
+    fn top_and_bottom_corners_go_side_by_side() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Top, None);
+        l.dock(2, Edge::Bottom, None);
+        let (t, e) = l.dock_target(AREA, 100, 590, 3).unwrap();
+        assert_eq!((t, e), (Some(2), Edge::Left));
+        assert_eq!(l.preview(3, e, t, AREA), Some(Rect::new(0, 300, 500, 300)));
+    }
+
+    #[test]
+    fn corner_of_the_empty_side_fills_it() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        let (t, e) = l.dock_target(AREA, 998, 50, 2).unwrap();
+        assert_eq!((t, e), (Some(EMPTY), Edge::Right));
+        assert_eq!(l.preview(2, e, t, AREA), Some(Rect::new(500, 0, 500, 600)));
+    }
+
+    #[test]
+    fn preview_of_the_only_window_moving_sides() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        assert_eq!(l.preview(1, Edge::Right, None, AREA), Some(Rect::new(500, 0, 500, 600)));
+        // Previewing changes nothing.
+        assert_eq!(rect_of(&l, 1), Rect::new(0, 0, 500, 600));
+    }
+
+    #[test]
     fn top_docks_only_when_pressed_against_it() {
         let l = Layout::new(0);
-        let w = Rect::new(400, 0, 300, 300);
-        assert_eq!(l.dock_target(AREA, 500, 0, w, 9), Some((None, Edge::Top)));
-        assert_eq!(l.dock_target(AREA, 500, 15, w, 9), None);
+        assert_eq!(l.dock_target(AREA, 500, 0, 9), Some((None, Edge::Top)));
+        assert_eq!(l.dock_target(AREA, 500, 15, 9), None);
     }
 
     #[test]
@@ -879,25 +999,10 @@ mod tests {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
         l.dock(2, Edge::Right, None);
-        let w = Rect::new(400, 100, 300, 300);
-        assert_eq!(l.dock_target(AREA, 2, 300, w, 9), Some((None, Edge::Left)));
-        assert_eq!(l.dock_target(AREA, 520, 300, w, 9), Some((Some(2), Edge::Left)));
-        assert_eq!(l.dock_target(AREA, 750, 580, w, 9), Some((None, Edge::Bottom)));
-        assert_eq!(l.dock_target(AREA, 750, 300, w, 9), None);
-    }
-
-    #[test]
-    fn dock_target_window_pushed_past_side() {
-        let l = Layout::new(0);
-        // Pointer mid-screen, but the window hangs off the left or right.
-        let off_left = Rect::new(-32, 72, 600, 400);
-        assert_eq!(l.dock_target(AREA, 400, 105, off_left, 9), Some((None, Edge::Left)));
-        let off_right = Rect::new(700, 72, 400, 400);
-        assert_eq!(l.dock_target(AREA, 800, 105, off_right, 9), Some((None, Edge::Right)));
-        // A few pixels over is just sloppy placement, and hanging off the
-        // bottom never docks.
-        assert_eq!(l.dock_target(AREA, 400, 105, Rect::new(-8, 72, 600, 400), 9), None);
-        assert_eq!(l.dock_target(AREA, 400, 300, Rect::new(100, 200, 600, 900), 9), None);
+        assert_eq!(l.dock_target(AREA, 2, 300, 9), Some((None, Edge::Left)));
+        assert_eq!(l.dock_target(AREA, 520, 300, 9), Some((Some(2), Edge::Left)));
+        assert_eq!(l.dock_target(AREA, 750, 580, 9), Some((None, Edge::Bottom)));
+        assert_eq!(l.dock_target(AREA, 750, 300, 9), None);
     }
 
     #[test]
