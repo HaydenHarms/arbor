@@ -15,7 +15,7 @@ cargo build --release
 .\target\release\lattice.exe
 ```
 
-Lattice lives in the system tray. Right-click the icon to show everything, float every window, or quit.
+Lattice lives in the system tray. Right-click the icon to show everything, open the overview, float every window, or quit.
 
 ## Using it
 
@@ -39,12 +39,20 @@ Lattice lives in the system tray. Right-click the icon to show everything, float
 - Tabs work with any app, because Lattice only moves windows. It never puts one app's window inside another's.
 - Switching to a hidden tab with Alt+Tab or the taskbar shows it. The same goes for any docked window zoomed out of view: Lattice steps out until it's in view.
 
+**Overview**
+
+- Step out past everything (`Ctrl+Alt+Up` or `Ctrl+Alt+Space` when everything is already showing) and the whole arrangement steps back into the overview: every docked window as a card with a live picture of it, in the same layout, without moving or resizing the windows themselves.
+- Click a card to go straight to that window, framed on its own. On a tab group's card, click a tab to pick it.
+- `Enter` does the same for the card under the pointer. `Esc`, a click on the background, or switching to another window puts the overview away and leaves things as they were. `Ctrl+Alt+Space` again goes back to showing everything.
+- Middle-click a card to close its window.
+- Cards too small to make out show the app's icon instead, tinted with its colour.
+
 **Keyboard**
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+Alt+Space` | Show everything |
-| `Ctrl+Alt+Up` | Step out a level |
+| `Ctrl+Alt+Space` | Show everything (again for the overview) |
+| `Ctrl+Alt+Up` | Step out a level (past everything: the overview) |
 | `Ctrl+Alt+Down` | Step in toward the window under the pointer |
 | `Ctrl+Alt+Enter` | Frame the active window on its own, docked or floating (again to put a floating one back) |
 | `Ctrl+Alt+Left` / `Right` | Move to the neighbouring space |
@@ -74,7 +82,6 @@ cargo test   # layout engine tests, runs on any OS
 
 ## Roadmap
 
-- Zoomed-out view with live DWM thumbnails, plus app colour and icon for windows too small to read
 - Pinch-to-zoom on precision touchpads
 - Saved views (`Ctrl+Alt+Shift+1–9` to save, `Ctrl+Alt+1–9` to recall)
 - Persist arrangements across restarts

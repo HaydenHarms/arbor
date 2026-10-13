@@ -4,7 +4,9 @@
 mod sys;
 
 use crate::frost;
-use crate::layout::{ease, fullscreen_drop, tab_bar_over, Edge, Layout, Placement, Rect, WinId};
+use crate::layout::{
+    card_parts, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Layout, Placement, Rect, WinId,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,6 +22,20 @@ const TAB_BAR: f32 = 32.0;
 const ANIM_TIMER: usize = 1;
 /// Updates the drop zone while a window is being dragged.
 const DRAG_TIMER: usize = 2;
+
+/// Moves the overview's pictures.
+const OVERVIEW_TIMER: usize = 3;
+/// Stepping out to the overview and back in, a touch slower than other
+/// motion as everything on the display moves at once.
+const OVERVIEW_MOTION: Duration = Duration::from_millis(300);
+/// The overview's cards, at 96 DPI: the gap between them, the height of the
+/// caption with their tabs, and the margin round the window's picture.
+const OVERVIEW_GAP: f32 = 24.0;
+const CAPTION: f32 = 32.0;
+const CARD_PAD: f32 = 6.0;
+/// A card's picture can't get smaller than this (at 96 DPI) and still be
+/// told apart; below it, the card shows the app's icon instead.
+const MIN_PICTURE: (f32, f32) = (140.0, 80.0);
 
 /// How the drop zone looks: frosted glass, a touch darker than what's under it.
 const ZONE_STYLE: frost::Style = frost::Style { blur: 2, darken: 40, corner: 10.0, border: 60 };
@@ -83,6 +99,40 @@ fn strip_rect(r: Rect, band: i32) -> Rect {
     Rect::new(b.x, b.y, b.w, b.h - GAP / 2)
 }
 
+/// A card in the overview: a spot in the arrangement, with a live picture
+/// of the window showing there flying between `from` and `to`.
+struct OverviewCell {
+    id: WinId,
+    /// Its tabs (just `id` for a lone window), which is showing, and where
+    /// each sits in the caption.
+    wins: Vec<WinId>,
+    active: usize,
+    tabs: Vec<(WinId, Rect)>,
+    card: Rect,
+    body: Rect,
+    /// The window's visible part, relative to its window rect.
+    crop: Rect,
+    thumb: isize,
+    from: Rect,
+    to: Rect,
+    /// Too small for a picture to be any use: show the app's icon.
+    small: bool,
+}
+
+/// The overview: every docked window on a display at once, as cards.
+struct Overview {
+    mon: MonId,
+    area: Rect,
+    cells: Vec<OverviewCell>,
+    hover: Option<usize>,
+    /// When the pictures set off, while they're flying.
+    motion: Option<Instant>,
+    /// Putting it away: who gets the focus after.
+    closing: Option<Hwnd>,
+    /// Who had the focus before it opened.
+    return_to: Hwnd,
+}
+
 struct Anim {
     start: Instant,
     from: HashMap<WinId, Rect>,
@@ -128,6 +178,11 @@ struct App {
     /// request to show it.
     last_fg: Hwnd,
     focus_lost: Option<Instant>,
+    /// The overview's window, and the overview while it's up.
+    overview_host: Hwnd,
+    overview: Option<Overview>,
+    /// Apps' colours, from their icons, for their cards in the overview.
+    tints: HashMap<WinId, Option<u32>>,
 }
 
 thread_local! {
@@ -179,6 +234,7 @@ pub fn run() {
     install_event_hooks(on_win_event);
     install_mouse_hook(hwnd, WM_MOUSE_HOOK);
     on_strip_input(on_strip);
+    on_overview_input(|ev, pt| with_app(|app| app.overview_input(ev, pt)));
     let overlay = create_overlay();
     with_app(|app| {
         app.hwnd = hwnd;
@@ -238,6 +294,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 16] = [
 ];
 
 const MENU_SHOW_ALL: usize = 100;
+const MENU_OVERVIEW: usize = 103;
 const MENU_FLOAT_ALL: usize = 101;
 const MENU_QUIT: usize = 102;
 
@@ -257,6 +314,10 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
             with_app(|app| app.drag_tick());
             Some(0)
         }
+        WM_TIMER if wparam == OVERVIEW_TIMER => {
+            with_app(|app| app.overview_tick());
+            Some(0)
+        }
         WM_MOUSE_HOOK => {
             if let Some((ev, pt)) = mouse_message(wparam, lparam) {
                 on_mouse(ev, pt);
@@ -268,10 +329,20 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
                 let hwnd = APP.with(|a| a.borrow().hwnd);
                 let pick = show_tray_menu(
                     hwnd,
-                    &[(MENU_SHOW_ALL, "Show everything"), (MENU_FLOAT_ALL, "Float all windows"), (0, ""), (MENU_QUIT, "Quit Lattice")],
+                    &[
+                        (MENU_SHOW_ALL, "Show everything"),
+                        (MENU_OVERVIEW, "Overview"),
+                        (MENU_FLOAT_ALL, "Float all windows"),
+                        (0, ""),
+                        (MENU_QUIT, "Quit Lattice"),
+                    ],
                 );
                 match pick {
                     MENU_SHOW_ALL => run_cmd(Cmd::ShowAll),
+                    MENU_OVERVIEW => with_app(|app| {
+                        app.unframe_float();
+                        app.open_overview(monitor_at(cursor_pos()));
+                    }),
                     MENU_FLOAT_ALL => run_cmd(Cmd::FloatAll),
                     MENU_QUIT => run_cmd(Cmd::Quit),
                     _ => {}
@@ -293,6 +364,22 @@ fn run_cmd(cmd: Cmd) {
         // Most commands act on the display the pointer is on.
         let mon = monitor_at(cursor_pos());
         trace!("cmd {cmd:?} fg {fg:#x} docked on {:?}", app.monitor_of(fg));
+        // With the overview up, showing everything (or stepping in) steps
+        // in from it; stepping out does nothing more. Anything else puts it
+        // away first.
+        if let Some(ov) = &app.overview {
+            let back = ov.return_to;
+            match cmd {
+                Cmd::ShowAll | Cmd::ZoomIn => app.close_overview(back, |l| l.zoom_all()),
+                Cmd::ZoomOut => {}
+                _ => app.end_overview(back),
+            }
+            if matches!(cmd, Cmd::ShowAll | Cmd::ZoomIn | Cmd::ZoomOut) {
+                return;
+            }
+        }
+        // Already showing everything: step out once more, to the overview.
+        let at_top = app.layouts.get(&mon).is_some_and(|l| l.camera.is_empty());
         // Every camera motion first puts a framed floating window back;
         // stepping out (or back) does only that.
         let framed = matches!(
@@ -300,6 +387,7 @@ fn run_cmd(cmd: Cmd) {
             Cmd::ShowAll | Cmd::ZoomOut | Cmd::ZoomIn | Cmd::Prev | Cmd::Next | Cmd::Back | Cmd::Forward
         ) && app.unframe_float();
         match cmd {
+            Cmd::ShowAll | Cmd::ZoomOut if at_top && !framed => app.open_overview(mon),
             Cmd::ShowAll => app.camera(mon, |l| l.zoom_all()),
             Cmd::ZoomOut if !framed => app.camera(mon, |l| l.zoom_out()),
             Cmd::ZoomIn => {
@@ -405,6 +493,7 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE => {
             app.focus_gone(hwnd);
             app.icons.remove(&hwnd);
+            app.tints.remove(&hwnd);
             app.minimized.remove(&hwnd);
             app.forget_framed(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
@@ -860,6 +949,9 @@ impl App {
         }
         self.animate(targets);
         self.refresh_bars();
+        if self.overview.as_ref().is_some_and(|o| o.mon == mon) {
+            self.rebuild_overview();
+        }
     }
 
     fn apply_all(&mut self) {
@@ -926,6 +1018,262 @@ impl App {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Overview
+
+    /// Step back past everything on display `mon`: every docked window as a
+    /// card with a live picture, flying out from where it is now.
+    fn open_overview(&mut self, mon: MonId) {
+        if self.layouts.get(&mon).is_none_or(|l| l.is_empty()) {
+            return;
+        }
+        self.finish_anim();
+        if !is_window(self.overview_host) {
+            self.overview_host = create_overview();
+        }
+        let area = work_area(mon);
+        set_overview(self.overview_host, vec![], None);
+        show_overview(self.overview_host, area);
+        let return_to = self.last_fg;
+        let cells = self.overview_cells(mon, area);
+        // Fly out from where each window is now; parked ones from where
+        // they'd be, off-screen, so they come into view as the camera pulls
+        // back.
+        let now: HashMap<WinId, Rect> = self.layouts[&mon].layout(area).into_iter().collect();
+        let mut cells = cells;
+        for c in &mut cells {
+            c.from = visual_rect(c.id).filter(|r| r.x > -20_000).or_else(|| now.get(&c.id).copied()).unwrap_or(c.to);
+        }
+        trace!("overview of {mon:#x}: {} cards", cells.len());
+        self.overview = Some(Overview { mon, area, cells, hover: None, motion: Some(Instant::now()), closing: None, return_to });
+        set_timer(self.hwnd, OVERVIEW_TIMER, 8);
+        self.overview_tick();
+    }
+
+    /// The overview's cards for display `mon`, each with its thumbnail
+    /// registered and sitting where it ends up.
+    fn overview_cells(&mut self, mon: MonId, area: Rect) -> Vec<OverviewCell> {
+        let s = monitor_scale(mon);
+        let px = |v: f32| (v * s).round() as i32;
+        let Some(l) = self.layouts.get(&mon) else { return vec![] };
+        let mut out = Vec::new();
+        for (id, card) in l.overview(overview_area(area), px(OVERVIEW_GAP)) {
+            let (cap, body) = card_parts(card, px(CAPTION), px(CARD_PAD));
+            // Too small even for a caption: just the app's icon, in the
+            // middle of the card.
+            let tiny = card.h < px(CAPTION) * 2 || card.w < px(CAPTION) * 3;
+            let body = if tiny { card } else { body };
+            let (wins, active) = l.group(id).map_or((vec![id], 0), |g| (g.wins.clone(), g.active));
+            let chips = if wins.len() == 1 {
+                vec![Rect::new(cap.x + px(2.0), cap.y, cap.w - px(4.0), cap.h)]
+            } else {
+                tab_rects(cap.w, cap.h, wins.len(), px(4.0), px(220.0))
+                    .into_iter()
+                    .map(|r| Rect::new(cap.x + r.x, cap.y + r.y, r.w, r.h))
+                    .collect()
+            };
+            let tabs = if tiny { vec![] } else { wins.iter().copied().zip(chips).collect() };
+            let crop = window_crop(id).unwrap_or(Rect::new(0, 0, body.w, body.h));
+            let to = fit(crop.w, crop.h, body);
+            let small = tiny || body.w < px(MIN_PICTURE.0) || body.h < px(MIN_PICTURE.1);
+            let thumb = thumb_register(self.overview_host, id);
+            out.push(OverviewCell { id, wins, active, tabs, card, body, crop, thumb, from: to, to, small });
+        }
+        out
+    }
+
+    /// The cards as the overview window draws them, in its own coordinates.
+    fn overview_cards(&mut self) -> Vec<Card> {
+        let Some(ov) = &self.overview else { return vec![] };
+        let s = monitor_scale(ov.mon);
+        let local = |r: Rect| Rect::new(r.x - ov.area.x, r.y - ov.area.y, r.w, r.h);
+        let mut cards = Vec::new();
+        for c in &ov.cells {
+            let tabs = c
+                .tabs
+                .iter()
+                .map(|&(w, r)| {
+                    let icon = *self.icons.entry(w).or_insert_with(|| window_icon(w));
+                    (local(r), Tab { title: window_title(w), icon })
+                })
+                .collect();
+            let icon = *self.icons.entry(c.id).or_insert_with(|| window_icon(c.id));
+            let tint = *self.tints.entry(c.id).or_insert_with(|| icon_colour(icon));
+            let icon_only = c.small.then(|| {
+                let size = ((32.0 * s) as i32).min(c.body.w).min(c.body.h).max(1);
+                let b = local(c.body);
+                (Rect::new(b.x + (b.w - size) / 2, b.y + (b.h - size) / 2, size, size), icon)
+            });
+            let (cap, _) = card_parts(c.card, (CAPTION * s).round() as i32, 0);
+            cards.push(Card { rect: local(c.card), caption: local(cap), tabs, active: c.active, tint, icon_only });
+        }
+        cards
+    }
+
+    /// Move the overview's thumbnails along their flight, and settle it
+    /// (or put it away) when they land.
+    fn overview_tick(&mut self) {
+        let Some(ov) = &self.overview else { return };
+        let t = ov.motion.map_or(1.0, |m| m.elapsed().as_secs_f32() / OVERVIEW_MOTION.as_secs_f32());
+        let k = ease(t);
+        let settled = t >= 1.0 && ov.closing.is_none();
+        for c in &ov.cells {
+            let r = Rect::lerp(c.from, c.to, k);
+            let local = Rect::new(r.x - ov.area.x, r.y - ov.area.y, r.w, r.h);
+            // The window may be changing size under it as it flies back in.
+            let crop = if ov.closing.is_some() { window_crop(c.id).unwrap_or(c.crop) } else { c.crop };
+            thumb_set(c.thumb, crop, local, !(settled && c.small));
+        }
+        if t < 1.0 {
+            return;
+        }
+        kill_timer(self.hwnd, OVERVIEW_TIMER);
+        if let Some(focus) = ov.closing {
+            self.end_overview(focus);
+        } else {
+            let hover = ov.hover;
+            self.overview.as_mut().expect("checked").motion = None;
+            let cards = self.overview_cards();
+            set_overview(self.overview_host, cards, hover);
+        }
+    }
+
+    /// Fly back into the arrangement, after `f` has moved the camera (or
+    /// not, to go back to where it was), and give `focus` the focus.
+    fn close_overview(&mut self, focus: Hwnd, f: impl FnOnce(&mut Layout)) {
+        let Some(ov) = &self.overview else { return };
+        if ov.closing.is_some() {
+            return;
+        }
+        let (mon, area) = (ov.mon, ov.area);
+        let t = ov.motion.map_or(1.0, |m| ease(m.elapsed().as_secs_f32() / OVERVIEW_MOTION.as_secs_f32()));
+        let now: Vec<Rect> = ov.cells.iter().map(|c| Rect::lerp(c.from, c.to, t)).collect();
+        self.overview.as_mut().expect("checked").closing = Some(focus);
+        // The windows go straight to their places, behind the overview,
+        // while their pictures fly there.
+        if let Some(l) = self.layouts.get_mut(&mon) {
+            f(l);
+        }
+        self.apply(mon);
+        self.finish_anim();
+        let l = self.layouts.get(&mon);
+        let to: HashMap<WinId, Rect> = l.map(|l| l.layout(area).into_iter().collect()).unwrap_or_default();
+        let shown: Vec<WinId> = ov_ids(&self.overview).map(|id| l.and_then(|l| l.group(id)).map_or(id, |g| g.shown())).collect();
+        let host = self.overview_host;
+        let ov = self.overview.as_mut().expect("checked");
+        for ((c, now), shown) in ov.cells.iter_mut().zip(now).zip(shown) {
+            // Picked another tab: fly in with that one's picture.
+            if shown != c.id {
+                thumb_unregister(c.thumb);
+                c.thumb = thumb_register(host, shown);
+                c.crop = window_crop(shown).unwrap_or(c.crop);
+                c.id = shown;
+            }
+            c.from = now;
+            c.to = to.get(&c.id).copied().unwrap_or(now);
+        }
+        ov.motion = Some(Instant::now());
+        set_overview(self.overview_host, vec![], None);
+        set_timer(self.hwnd, OVERVIEW_TIMER, 8);
+        self.overview_tick();
+    }
+
+    /// Put the overview away at once.
+    fn end_overview(&mut self, focus: Hwnd) {
+        let Some(ov) = self.overview.take() else { return };
+        kill_timer(self.hwnd, OVERVIEW_TIMER);
+        for c in ov.cells {
+            thumb_unregister(c.thumb);
+        }
+        // Focus first: hiding the overview first would hand the focus to
+        // whatever window was last active, which may be off camera, and
+        // Lattice would go to show it.
+        if focus != 0 && is_window(focus) {
+            set_foreground(focus);
+        }
+        hide_overview(self.overview_host);
+    }
+
+    /// Something changed on the overview's display while it's up (a window
+    /// closed, say): lay the cards out again.
+    fn rebuild_overview(&mut self) {
+        let Some(ov) = &mut self.overview else { return };
+        if ov.closing.is_some() {
+            return;
+        }
+        let (mon, area) = (ov.mon, ov.area);
+        for c in std::mem::take(&mut ov.cells) {
+            thumb_unregister(c.thumb);
+        }
+        if self.layouts.get(&mon).is_none_or(|l| l.is_empty()) {
+            let to = self.overview.as_ref().expect("checked").return_to;
+            self.end_overview(to);
+            return;
+        }
+        let cells = self.overview_cells(mon, area);
+        let ov = self.overview.as_mut().expect("checked");
+        ov.cells = cells;
+        ov.motion = None;
+        ov.hover = None;
+        self.overview_tick();
+    }
+
+    /// The card under screen point `pt`, and the window in it that's meant:
+    /// the tab under the pointer, or the one showing.
+    fn overview_hit(&self, pt: (i32, i32)) -> Option<(usize, WinId)> {
+        let ov = self.overview.as_ref()?;
+        let i = ov.cells.iter().position(|c| c.card.contains(pt.0, pt.1))?;
+        let c = &ov.cells[i];
+        let tab = c.tabs.iter().find(|(_, r)| c.wins.len() > 1 && r.contains(pt.0, pt.1)).map(|&(w, _)| w);
+        Some((i, tab.unwrap_or(c.id)))
+    }
+
+    fn overview_input(&mut self, ev: OverviewEvent, pt: (i32, i32)) {
+        let Some(ov) = &self.overview else { return };
+        if ov.closing.is_some() {
+            return;
+        }
+        let return_to = ov.return_to;
+        let hit = self.overview_hit(pt);
+        trace!("overview {ev:?} at {pt:?}: {hit:?}");
+        match ev {
+            OverviewEvent::Move => {
+                let hover = hit.map(|(i, _)| i);
+                let ov = self.overview.as_mut().expect("checked");
+                if hover != ov.hover {
+                    ov.hover = hover;
+                    if ov.motion.is_none() {
+                        let cards = self.overview_cards();
+                        set_overview(self.overview_host, cards, hover);
+                    }
+                }
+            }
+            OverviewEvent::Click => match hit {
+                Some((_, w)) => self.close_overview(w, |l| {
+                    l.select(w);
+                    l.frame(w);
+                }),
+                None => self.close_overview(return_to, |_| {}),
+            },
+            OverviewEvent::Middle => {
+                if let Some((_, w)) = hit {
+                    close_window(w);
+                }
+            }
+            OverviewEvent::Key(VK_ESCAPE) => self.close_overview(return_to, |_| {}),
+            OverviewEvent::Key(VK_RETURN | VK_SPACE) => match self.overview.as_ref().and_then(|o| o.hover) {
+                Some(i) => {
+                    let w = self.overview.as_ref().expect("checked").cells[i].id;
+                    self.close_overview(w, |l| l.frame(w));
+                }
+                None => self.close_overview(return_to, |l| l.zoom_all()),
+            },
+            OverviewEvent::Key(_) => {}
+            // Gone to another window (Alt+Tab, the taskbar): step back in.
+            OverviewEvent::Away => self.close_overview(0, |_| {}),
+        }
+    }
+
     /// Release every window: back to a normal desktop, nothing lost.
     fn float_all(&mut self) {
         self.unframe_float();
@@ -942,6 +1290,11 @@ impl App {
         rescue_list_clear();
         self.refresh_bars();
     }
+}
+
+/// The windows on the overview's cards, if it's up.
+fn ov_ids(ov: &Option<Overview>) -> impl Iterator<Item = WinId> + '_ {
+    ov.iter().flat_map(|o| o.cells.iter().map(|c| c.id))
 }
 
 /// Where a window framed on its own sits on display `mon`: the work area,

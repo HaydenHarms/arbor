@@ -10,12 +10,14 @@ use windows::Win32::Foundation::{
     GetLastError, BOOL, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmGetWindowAttribute, DwmRegisterThumbnail, DwmSetWindowAttribute, DwmUnregisterThumbnail,
+    DwmUpdateThumbnailProperties, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
+    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetDIBits,
+    GetMonitorInfoW, GetObjectW, GetStockObject, UpdateWindow, BITMAP, NULL_BRUSH, PS_SOLID,
     InvalidateRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, ScreenToClient, SelectObject, SetBkMode,
     SetStretchBltMode, SetTextColor, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     BLENDFUNCTION, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBITMAP,
@@ -60,6 +62,7 @@ pub const VK_OEM_4: u32 = 0xDB; // [
 pub const VK_OEM_6: u32 = 0xDD; // ]
 pub const VK_PRIOR: u32 = 0x21; // Page Up
 pub const VK_NEXT: u32 = 0x22; // Page Down
+pub const VK_ESCAPE: u32 = 0x1B;
 pub const VK_F: u32 = 0x46;
 pub const VK_Q: u32 = 0x51;
 
@@ -931,6 +934,343 @@ unsafe fn paint_strip(h: HWND) {
     let _ = DeleteObject(bmp);
     let _ = DeleteDC(mem);
     let _ = EndPaint(h, &ps);
+}
+
+// ---------------------------------------------------------------------------
+// Overview: a window covering a display, showing every docked window on it
+// as a card with a live DWM thumbnail. The app lays the cards out and moves
+// the thumbnails; this draws the cards and reports input.
+
+/// One card as the overview draws it, in the overview's client coordinates.
+#[derive(Clone)]
+pub struct Card {
+    pub rect: Rect,
+    pub caption: Rect,
+    /// The card's tabs and where each sits in the caption. A lone window
+    /// has one, drawn as a plain title.
+    pub tabs: Vec<(Rect, Tab)>,
+    pub active: usize,
+    /// The app's colour (0xBBGGRR), tinting the caption, if it has one.
+    pub tint: Option<u32>,
+    /// Too small for a picture: the app's icon goes here instead.
+    pub icon_only: Option<(Rect, isize)>,
+}
+
+struct OverviewData {
+    cards: Vec<Card>,
+    hover: Option<usize>,
+    light: bool,
+}
+
+static OVERVIEW: Mutex<OverviewData> = Mutex::new(OverviewData { cards: Vec::new(), hover: None, light: false });
+
+/// Input on the overview, with the pointer in screen coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverviewEvent {
+    Move,
+    Click,
+    Middle,
+    Key(u32),
+    /// Another window took the focus.
+    Away,
+}
+
+type OverviewFn = fn(OverviewEvent, (i32, i32));
+static OVERVIEW_FN: Mutex<Option<OverviewFn>> = Mutex::new(None);
+/// Posted to itself when the overview loses the focus, so the app hears of
+/// it from the message loop rather than in the middle of whatever moved it.
+const WM_OVERVIEW_AWAY: u32 = wm::WM_APP + 5;
+
+unsafe extern "system" fn overview_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let ev = match msg {
+        wm::WM_ERASEBKGND => return LRESULT(1),
+        wm::WM_PAINT => {
+            paint_overview(h);
+            return LRESULT(0);
+        }
+        wm::WM_ACTIVATE => {
+            if wp.0 & 0xffff == wm::WA_INACTIVE as usize {
+                let _ = wm::PostMessageW(h, WM_OVERVIEW_AWAY, WPARAM(0), LPARAM(0));
+            }
+            return LRESULT(0);
+        }
+        WM_OVERVIEW_AWAY => OverviewEvent::Away,
+        wm::WM_MOUSEMOVE => OverviewEvent::Move,
+        wm::WM_LBUTTONUP => OverviewEvent::Click,
+        wm::WM_MBUTTONUP => OverviewEvent::Middle,
+        wm::WM_KEYDOWN => OverviewEvent::Key(wp.0 as u32),
+        _ => return wm::DefWindowProcW(h, msg, wp, lp),
+    };
+    let mut p = POINT::default();
+    let _ = wm::GetCursorPos(&mut p);
+    let f = *OVERVIEW_FN.lock().unwrap();
+    if let Some(f) = f {
+        f(ev, (p.x, p.y));
+    }
+    LRESULT(0)
+}
+
+/// Set the callback for input on the overview.
+pub fn on_overview_input(f: OverviewFn) {
+    *OVERVIEW_FN.lock().unwrap() = Some(f);
+}
+
+pub fn create_overview() -> Hwnd {
+    unsafe {
+        let Ok(inst) = GetModuleHandleW(None) else { return 0 };
+        let class = w!("LatticeOverview");
+        let wc = wm::WNDCLASSW {
+            lpfnWndProc: Some(overview_proc),
+            hInstance: inst.into(),
+            lpszClassName: class,
+            hCursor: wm::LoadCursorW(None, wm::IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        wm::RegisterClassW(&wc);
+        let ex = wm::WS_EX_TOPMOST | wm::WS_EX_TOOLWINDOW;
+        let Ok(h) =
+            wm::CreateWindowExW(ex, class, w!("Lattice overview"), wm::WS_POPUP, 0, 0, 0, 0, None, None, inst, None)
+        else {
+            return 0;
+        };
+        h.0 as isize
+    }
+}
+
+/// Show the overview over `r`, on top of everything, with the focus.
+pub fn show_overview(h: Hwnd, r: Rect) {
+    OVERVIEW.lock().unwrap().light = light_theme();
+    unsafe {
+        let _ = wm::SetWindowPos(hwnd(h), wm::HWND_TOPMOST, r.x, r.y, r.w, r.h, wm::SWP_SHOWWINDOW);
+        let _ = wm::SetForegroundWindow(hwnd(h));
+        let _ = UpdateWindow(hwnd(h));
+    }
+}
+
+pub fn hide_overview(h: Hwnd) {
+    set_overview(h, vec![], None);
+    unsafe {
+        let _ = wm::ShowWindow(hwnd(h), wm::SW_HIDE);
+    }
+}
+
+/// What the overview shows: its cards (none while they fly in or out), and
+/// the one under the pointer. Repaints it.
+pub fn set_overview(h: Hwnd, cards: Vec<Card>, hover: Option<usize>) {
+    {
+        let mut d = OVERVIEW.lock().unwrap();
+        d.cards = cards;
+        d.hover = hover;
+    }
+    unsafe {
+        let _ = InvalidateRect(hwnd(h), None, false);
+    }
+}
+
+/// Mix `a` toward `b` by `k` (0..=1), both 0xBBGGRR.
+fn mix(a: u32, b: u32, k: f32) -> u32 {
+    let ch = |s: u32| {
+        let (x, y) = (((a >> s) & 0xff) as f32, ((b >> s) & 0xff) as f32);
+        ((x + (y - x) * k).round() as u32) << s
+    };
+    ch(0) | ch(8) | ch(16)
+}
+
+unsafe fn paint_overview(h: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let dc = BeginPaint(h, &mut ps);
+    let mut rc = RECT::default();
+    let _ = wm::GetClientRect(h, &mut rc);
+    let (w, ht) = (rc.right.max(1), rc.bottom.max(1));
+    let mem = CreateCompatibleDC(dc);
+    let bmp = CreateCompatibleBitmap(dc, w, ht);
+    let old = SelectObject(mem, bmp);
+
+    let (cards, hover, light) = {
+        let d = OVERVIEW.lock().unwrap();
+        (d.cards.clone(), d.hover, d.light)
+    };
+    // Colours as 0xBBGGRR.
+    let (bg, card_bg, chip, text, dim, accent) = if light {
+        (0xd6d2ce, 0xf3f3f3, 0xffffff, 0x1a1a1a, 0x5c5c5c, 0xb85f00)
+    } else {
+        (0x161412, 0x2c2c2c, 0x444444, 0xffffff, 0xa8a8a8, 0xffc24c)
+    };
+    let fill = |r: RECT, c: u32| {
+        let b = CreateSolidBrush(COLORREF(c));
+        FillRect(mem, &r, b);
+        let _ = DeleteObject(b);
+    };
+    let round = |r: Rect, c: u32, rad: i32| {
+        let b = CreateSolidBrush(COLORREF(c));
+        let old_b = SelectObject(mem, b);
+        let _ = RoundRect(mem, r.x, r.y, r.x + r.w + 1, r.y + r.h + 1, rad, rad);
+        SelectObject(mem, old_b);
+        let _ = DeleteObject(b);
+    };
+    fill(rc, bg);
+
+    let s = GetDpiForWindow(h) as f32 / 96.0;
+    let px = |v: f32| (v * s).round() as i32;
+    let font = CreateFontW(-px(12.0), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
+    let old_font = SelectObject(mem, font);
+    let _ = SetBkMode(mem, TRANSPARENT);
+    let old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
+    let icon_at = |icon: isize, x: i32, y: i32, size: i32| {
+        if icon != 0 {
+            let _ = wm::DrawIconEx(mem, x, y, wm::HICON(icon as *mut c_void), size, size, 0, None, wm::DI_NORMAL);
+        }
+    };
+    for (i, c) in cards.iter().enumerate() {
+        let tint = |base: u32, k: f32| c.tint.map_or(base, |t| mix(base, t, k));
+        if c.icon_only.is_some() {
+            round(c.rect, tint(card_bg, 0.45), px(10.0));
+        } else {
+            // The caption, tinted with the app's colour, rounded at the top
+            // and square where the picture meets it.
+            round(c.rect, card_bg, px(10.0));
+            let cap = tint(card_bg, 0.25);
+            round(c.caption, cap, px(10.0));
+            let half = c.caption.h / 2;
+            let (x, y) = (c.caption.x, c.caption.y);
+            fill(RECT { left: x, top: y + half, right: x + c.caption.w, bottom: y + c.caption.h }, cap);
+        }
+        let lone = c.tabs.len() == 1;
+        for (j, (r, t)) in c.tabs.iter().enumerate() {
+            let picked = j == c.active;
+            if picked && !lone {
+                round(*r, tint(chip, 0.2), px(6.0));
+            }
+            let icon = px(16.0);
+            let mut x = r.x + px(8.0);
+            if t.icon != 0 {
+                icon_at(t.icon, x, r.y + (r.h - icon) / 2, icon);
+                x += icon + px(8.0);
+            }
+            let _ = SetTextColor(mem, COLORREF(if picked { text } else { dim }));
+            let mut tr = RECT { left: x, top: r.y, right: r.x + r.w - px(8.0), bottom: r.y + r.h };
+            let mut title: Vec<u16> = t.title.encode_utf16().collect();
+            DrawTextW(mem, &mut title, &mut tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | DT_LEFT);
+        }
+        if let Some((r, icon)) = c.icon_only {
+            icon_at(icon, r.x, r.y, r.w);
+        }
+        if hover == Some(i) {
+            let pen = CreatePen(PS_SOLID, px(2.0).max(2), COLORREF(accent));
+            let p = SelectObject(mem, pen);
+            let b = SelectObject(mem, GetStockObject(NULL_BRUSH));
+            let r = c.rect;
+            let _ = RoundRect(mem, r.x, r.y, r.x + r.w + 1, r.y + r.h + 1, px(10.0), px(10.0));
+            SelectObject(mem, b);
+            SelectObject(mem, p);
+            let _ = DeleteObject(pen);
+        }
+    }
+    SelectObject(mem, old_pen);
+    SelectObject(mem, old_font);
+    let _ = DeleteObject(font);
+
+    let _ = BitBlt(dc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteDC(mem);
+    let _ = EndPaint(h, &ps);
+}
+
+/// Show a live picture of window `src` in window `dest`. 0 if it can't.
+pub fn thumb_register(dest: Hwnd, src: Hwnd) -> isize {
+    unsafe { DwmRegisterThumbnail(hwnd(dest), hwnd(src)).unwrap_or(0) }
+}
+
+pub fn thumb_unregister(t: isize) {
+    if t != 0 {
+        unsafe {
+            let _ = DwmUnregisterThumbnail(t);
+        }
+    }
+}
+
+/// Draw the `crop` part of thumbnail `t`'s window (relative to its window
+/// rect) at `dest`, in the overview's client coordinates.
+pub fn thumb_set(t: isize, crop: Rect, dest: Rect, visible: bool) {
+    let r = |r: Rect| RECT { left: r.x, top: r.y, right: r.x + r.w, bottom: r.y + r.h };
+    let props = DWM_THUMBNAIL_PROPERTIES {
+        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE,
+        rcDestination: r(dest),
+        rcSource: r(crop),
+        fVisible: visible.into(),
+        ..Default::default()
+    };
+    unsafe {
+        let _ = DwmUpdateThumbnailProperties(t, &props);
+    }
+}
+
+/// The visible part of window `h`, relative to its window rect: what a
+/// thumbnail of it shows, leaving out the invisible resize borders.
+pub fn window_crop(h: Hwnd) -> Option<Rect> {
+    let (w, f) = (window_rect(h)?, frame_bounds(h)?);
+    Some(Rect::new(f.left - w.left, f.top - w.top, f.right - f.left, f.bottom - f.top))
+}
+
+/// The main colour of an icon (0xBBGGRR): the average of its solid pixels,
+/// leaning toward the more colourful ones.
+pub fn icon_colour(icon: isize) -> Option<u32> {
+    if icon == 0 {
+        return None;
+    }
+    unsafe {
+        let mut info = wm::ICONINFO::default();
+        wm::GetIconInfo(wm::HICON(icon as *mut c_void), &mut info).ok()?;
+        let colour = icon_bitmap_colour(info.hbmColor);
+        let _ = DeleteObject(info.hbmColor);
+        let _ = DeleteObject(info.hbmMask);
+        colour
+    }
+}
+
+unsafe fn icon_bitmap_colour(bmp: HBITMAP) -> Option<u32> {
+    let mut bm = BITMAP::default();
+    if bmp.is_invalid() || GetObjectW(bmp, std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void)) == 0 {
+        return None;
+    }
+    let (w, h) = (bm.bmWidth.max(1), bm.bmHeight.abs().max(1));
+    let mut px = vec![0u32; (w * h) as usize];
+    let mut bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let dc = GetDC(None);
+    let got = GetDIBits(dc, bmp, 0, h as u32, Some(px.as_mut_ptr() as *mut c_void), &mut bi, DIB_RGB_COLORS);
+    ReleaseDC(None, dc);
+    if got == 0 {
+        return None;
+    }
+    let has_alpha = px.iter().any(|p| p >> 24 != 0);
+    let (mut sum, mut total) = ([0f32; 3], 0f32);
+    for &p in &px {
+        if has_alpha && p >> 24 < 128 {
+            continue;
+        }
+        let (r, g, b) = (((p >> 16) & 0xff) as f32, ((p >> 8) & 0xff) as f32, (p & 0xff) as f32);
+        let k = 0.1 + (r.max(g).max(b) - r.min(g).min(b)) / 255.0;
+        sum[0] += r * k;
+        sum[1] += g * k;
+        sum[2] += b * k;
+        total += k;
+    }
+    (total > 0.0).then(|| {
+        let c = |v: f32| (v / total).round().clamp(0.0, 255.0) as u32;
+        c(sum[2]) << 16 | c(sum[1]) << 8 | c(sum[0])
+    })
 }
 
 /// Whether apps are set to the light theme (Settings, Personalization,

@@ -508,7 +508,7 @@ impl Layout {
     fn empty_against(&self, edge: Edge) -> Option<Vec<usize>> {
         let root = self.root.as_ref()?;
         let canvas = Rect::new(0, 0, 10_000, 10_000);
-        let cam = self.camera_rect(canvas);
+        let cam = self.camera_rect(canvas, &self.camera);
         let mut rects = Vec::new();
         root.layout(canvas, 0, &mut rects);
         let (_, r) = rects.into_iter().find(|(w, _)| *w == EMPTY)?;
@@ -556,8 +556,21 @@ impl Layout {
         self.layout_with_empty(area).into_iter().find(|(w, _)| *w == leaf).map(|(_, r)| r)
     }
 
+    /// The whole tree in `area`, wherever the camera is, `gap` apart: each
+    /// spot with the window standing for it (a group's showing tab), its
+    /// strip of tabs included. The overview shows this without moving any
+    /// window.
+    pub fn overview(&self, area: Rect, gap: i32) -> Vec<(WinId, Rect)> {
+        self.layout_from(area, &[], gap).into_iter().filter(|(id, _)| *id != EMPTY).collect()
+    }
+
     /// Like `layout`, but including the rect of the empty space, if any.
     fn layout_with_empty(&self, area: Rect) -> Vec<(WinId, Rect)> {
+        self.layout_from(area, &self.camera, self.gap)
+    }
+
+    /// The tree laid out with the node at `camera` filling `area`.
+    fn layout_from(&self, area: Rect, camera: &[usize], gap: i32) -> Vec<(WinId, Rect)> {
         let Some(root) = &self.root else { return vec![] };
         let mut out = Vec::new();
         // Lay the whole tree out in a virtual canvas, then map the camera's
@@ -565,7 +578,7 @@ impl Layout {
         let canvas = Rect::new(0, 0, 10_000, 10_000);
         let mut virt = Vec::new();
         root.layout(canvas, 0, &mut virt);
-        let cam = self.camera_rect(canvas);
+        let cam = self.camera_rect(canvas, camera);
         let sx = area.w as f32 / cam.w as f32;
         let sy = area.h as f32 / cam.h as f32;
         for (id, r) in virt {
@@ -575,15 +588,15 @@ impl Layout {
                 (r.w as f32 * sx).round() as i32,
                 (r.h as f32 * sy).round() as i32,
             );
-            out.push((id, mapped.inset(self.gap / 2)));
+            out.push((id, mapped.inset(gap / 2)));
         }
         out
     }
 
-    fn camera_rect(&self, canvas: Rect) -> Rect {
+    fn camera_rect(&self, canvas: Rect, camera: &[usize]) -> Rect {
         let mut node = self.root.as_ref().unwrap();
         let mut r = canvas;
-        for &i in &self.camera {
+        for &i in camera {
             let Node::Split { axis, children, weights } = node else { break };
             r = split_rects(r, *axis, weights)[i];
             node = &children[i];
@@ -880,6 +893,37 @@ pub fn tab_at(tabs: &[Rect], x: i32) -> Option<usize> {
         return None;
     }
     Some(tabs.iter().rposition(|t| x >= t.x - 1).unwrap_or(0))
+}
+
+/// Where the overview lays everything out on a display with work area
+/// `area`: the whole arrangement, stepped back to leave a margin around it.
+pub fn overview_area(area: Rect) -> Rect {
+    let (mx, my) = (area.w / 20, area.h / 20);
+    Rect::new(area.x + mx, area.y + my, area.w - 2 * mx, area.h - 2 * my)
+}
+
+/// A card in the overview, split into its caption, `caption` tall along the
+/// top, and the room under it for the window's picture, `pad` in from the
+/// card's other edges.
+pub fn card_parts(card: Rect, caption: i32, pad: i32) -> (Rect, Rect) {
+    let caption = caption.min(card.h);
+    let body = Rect::new(
+        card.x + pad,
+        card.y + caption,
+        (card.w - 2 * pad).max(1),
+        (card.h - caption - pad).max(1),
+    );
+    (Rect::new(card.x, card.y, card.w, caption), body)
+}
+
+/// A `w`×`h` picture scaled to fit inside `r`, keeping its shape, centred.
+pub fn fit(w: i32, h: i32, r: Rect) -> Rect {
+    if w <= 0 || h <= 0 {
+        return r;
+    }
+    let k = (r.w as f32 / w as f32).min(r.h as f32 / h as f32);
+    let (fw, fh) = ((w as f32 * k).round() as i32, (h as f32 * k).round() as i32);
+    Rect::new(r.x + (r.w - fw) / 2, r.y + (r.h - fh) / 2, fw.max(1), fh.max(1))
 }
 
 /// Whether a drop at (px, py) fills the display: pressed against the top,
@@ -1403,6 +1447,43 @@ mod tests {
         assert_eq!(tab_at(&tabs, 300), Some(1));
         assert_eq!(tab_at(&tabs, 450), None, "past the last tab");
         assert_eq!(tab_at(&[], 10), None);
+    }
+
+    #[test]
+    fn overview_shows_the_whole_tree_wherever_the_camera_is() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        l.dock(3, Edge::Bottom, Some(2));
+        l.tab(4, 1);
+        l.frame(3);
+        let all = l.overview(AREA, 0);
+        assert_eq!(all.len(), 3, "one card per spot: {all:?}");
+        let at = |id| all.iter().find(|(w, _)| *w == id).map(|(_, r)| *r);
+        // The group's spot, strip included, under the tab showing.
+        assert_eq!(at(4), Some(Rect::new(0, 0, 500, 600)));
+        assert_eq!(at(1), None);
+        assert_eq!(at(3), Some(Rect::new(500, 300, 500, 300)));
+        // The camera is untouched.
+        assert_eq!(rect_of(&l, 3), AREA);
+        // Gaps are its own.
+        assert_eq!(l.overview(AREA, 20).iter().find(|(w, _)| *w == 2).unwrap().1, Rect::new(510, 10, 480, 280));
+        // No card for empty space.
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        assert_eq!(l.overview(AREA, 0), vec![(1, Rect::new(0, 0, 500, 600))]);
+    }
+
+    #[test]
+    fn overview_geometry() {
+        assert_eq!(overview_area(Rect::new(100, 0, 1000, 600)), Rect::new(150, 30, 900, 540));
+        let (cap, body) = card_parts(Rect::new(0, 0, 300, 200), 30, 6);
+        assert_eq!(cap, Rect::new(0, 0, 300, 30));
+        assert_eq!(body, Rect::new(6, 30, 288, 164));
+        // Wide into tall, tall into wide, keeping shape.
+        assert_eq!(fit(200, 100, Rect::new(0, 0, 100, 100)), Rect::new(0, 25, 100, 50));
+        assert_eq!(fit(100, 200, Rect::new(10, 10, 100, 100)), Rect::new(35, 10, 50, 100));
+        assert_eq!(fit(0, 0, Rect::new(1, 2, 3, 4)), Rect::new(1, 2, 3, 4));
     }
 
     #[test]
