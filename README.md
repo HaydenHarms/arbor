@@ -29,7 +29,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, float
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+Alt+Space` | Show everything |
+| `Ctrl+Alt+0` | Show everything |
 | `Ctrl+Alt+Up` | Step out a level |
 | `Ctrl+Alt+Down` | Step in toward the window under the pointer |
 | `Ctrl+Alt+Enter` | Frame the active window on its own |
