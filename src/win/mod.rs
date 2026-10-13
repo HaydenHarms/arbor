@@ -4,9 +4,10 @@
 mod sys;
 
 use crate::frost;
-use crate::layout::{ease, Edge, Layout, Placement, Rect, WinId};
+use crate::layout::{ease, fullscreen_drop, Edge, Layout, Placement, Rect, WinId};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sys::*;
 
@@ -21,13 +22,37 @@ const DRAG_TIMER: usize = 2;
 const ZONE_STYLE: frost::Style = frost::Style { blur: 2, darken: 40, corner: 10.0, border: 60 };
 /// The drop zone's frost is captured at 1/ZONE_SCALE size, then blurred.
 const ZONE_SCALE: i32 = 8;
-/// How often the frost is redrawn while the zone stays put.
-const ZONE_REFRESH: Duration = Duration::from_millis(100);
 
-/// The screen under `r`, frosted.
-fn frosted(r: Rect) -> Vec<u32> {
+/// A small snapshot of a display's work area, taken once when a drag starts
+/// and cropped for every drop zone in that drag. Reading the screen waits
+/// for the compositor (about a frame, whatever the size), so it happens once,
+/// on a worker thread, rather than each time the zone moves.
+struct Backdrop {
+    area: Rect,
+    w: usize,
+    h: usize,
+    px: Vec<u32>,
+}
+
+type SharedBackdrop = Arc<Mutex<Option<Backdrop>>>;
+
+/// Start capturing `area` in the background; the slot fills when it's done.
+fn snapshot(area: Rect) -> SharedBackdrop {
+    let slot = SharedBackdrop::default();
+    let fill = slot.clone();
+    std::thread::spawn(move || {
+        let (w, h) = ((area.w / ZONE_SCALE).max(1) as usize, (area.h / ZONE_SCALE).max(1) as usize);
+        let px = capture_scaled(area, w, h);
+        *fill.lock().unwrap() = Some(Backdrop { area, w, h, px });
+    });
+    slot
+}
+
+/// The backdrop under `r`, frosted.
+fn frosted(r: Rect, b: &Backdrop) -> Vec<u32> {
     let (sw, sh) = ((r.w / ZONE_SCALE).max(1) as usize, (r.h / ZONE_SCALE).max(1) as usize);
-    let mut small = capture_scaled(r, sw, sh);
+    let (x, y) = ((r.x - b.area.x) / ZONE_SCALE, (r.y - b.area.y) / ZONE_SCALE);
+    let mut small = frost::crop(&b.px, b.w, b.h, x as isize, y as isize, sw, sh);
     frost::blur(&mut small, sw, sh, ZONE_STYLE.blur);
     frost::compose(&small, sw, sh, r.w.max(1) as usize, r.h.max(1) as usize, &ZONE_STYLE)
 }
@@ -49,16 +74,19 @@ struct App {
     /// Visual rect of a window when a user drag began.
     drag_start: HashMap<WinId, Rect>,
     anim: Option<Anim>,
-    /// The drop-zone panel, where it's showing (None = hidden), when it was
-    /// last drawn, and the window being dragged, which it sits just under.
+    /// The drop-zone panel, where it's showing (None = hidden), and the
+    /// window being dragged, which it sits just under.
     overlay: Hwnd,
     drop_zone: Option<Rect>,
-    zone_drawn: Option<Instant>,
     dragging: Hwnd,
+    /// What the screen looked like when the drag began, for the frost.
+    backdrop: Option<SharedBackdrop>,
     /// A left-button press on a maximized window (and where), which may turn
-    /// into a drag that Lattice has to start itself; and one that did.
+    /// into a drag that Lattice has to start itself.
     press: Option<(Hwnd, (i32, i32))>,
-    restore_drag: Option<(Hwnd, (i32, i32))>,
+    /// A floating window framed to fill its display, and where it was, to
+    /// put it back when you step out.
+    framed_float: Option<(WinId, Rect)>,
 }
 
 thread_local! {
@@ -108,7 +136,7 @@ pub fn run() {
     trace!("started; hotkeys taken: {failed:?}");
     add_tray_icon(hwnd, "Lattice: dock, nest and zoom your windows");
     install_event_hooks(on_win_event);
-    install_mouse_hook(on_mouse);
+    install_mouse_hook(hwnd, WM_MOUSE_HOOK);
     let overlay = create_overlay();
     with_app(|app| {
         app.hwnd = hwnd;
@@ -130,7 +158,7 @@ pub fn run() {
 // ---------------------------------------------------------------------------
 // Hotkeys
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Cmd {
     ShowAll,
     ZoomOut,
@@ -183,8 +211,10 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
             with_app(|app| app.drag_tick());
             Some(0)
         }
-        WM_RESTORE_DRAG => {
-            with_app(|app| app.restore_drag());
+        WM_MOUSE_HOOK => {
+            if let Some((ev, pt)) = mouse_message(wparam, lparam) {
+                on_mouse(ev, pt);
+            }
             Some(0)
         }
         WM_TRAY => {
@@ -216,29 +246,47 @@ fn run_cmd(cmd: Cmd) {
         let fg = foreground_window();
         // Most commands act on the display the pointer is on.
         let mon = monitor_at(cursor_pos());
+        trace!("cmd {cmd:?} fg {fg:#x} docked on {:?}", app.monitor_of(fg));
+        // Every camera motion first puts a framed floating window back;
+        // stepping out (or back) does only that.
+        let framed = matches!(
+            cmd,
+            Cmd::ShowAll | Cmd::ZoomOut | Cmd::ZoomIn | Cmd::Prev | Cmd::Next | Cmd::Back | Cmd::Forward
+        ) && app.unframe_float();
         match cmd {
             Cmd::ShowAll => app.camera(mon, |l| l.zoom_all()),
-            Cmd::ZoomOut => app.camera(mon, |l| l.zoom_out()),
+            Cmd::ZoomOut if !framed => app.camera(mon, |l| l.zoom_out()),
             Cmd::ZoomIn => {
                 let under = root_window_at(cursor_pos());
                 app.camera(mon, |l| l.zoom_in_toward(under));
             }
             Cmd::Frame => {
-                let m = app.monitor_of(fg).unwrap_or(mon);
-                app.camera(m, |l| l.frame(fg));
+                if let Some(m) = app.monitor_of(fg) {
+                    app.unframe_float();
+                    app.camera(m, |l| l.frame(fg));
+                } else if app.framed_float.is_some_and(|(id, _)| id == fg) {
+                    app.unframe_float();
+                } else if is_manageable(fg) {
+                    if let Some(r) = visual_rect(fg) {
+                        app.frame_float(fg, monitor_of_window(fg), r);
+                    }
+                }
             }
             Cmd::Prev => app.camera(mon, |l| l.neighbour(-1)),
             Cmd::Next => app.camera(mon, |l| l.neighbour(1)),
-            Cmd::Back => app.camera(mon, |l| l.back()),
+            Cmd::Back if !framed => app.camera(mon, |l| l.back()),
             Cmd::Forward => app.camera(mon, |l| l.forward()),
+            Cmd::ZoomOut | Cmd::Back => {}
             Cmd::Dock(edge) => {
                 if is_manageable(fg) {
+                    app.forget_framed(fg);
                     let m = monitor_of_window(fg);
                     app.undock(fg);
                     app.dock(fg, m, edge, None);
                 }
             }
             Cmd::Float => {
+                app.forget_framed(fg);
                 if app.monitor_of(fg).is_some() {
                     app.undock(fg);
                     app.apply_all();
@@ -265,8 +313,11 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
     }
     with_app(|app| match event {
         EVENT_SYSTEM_MOVESIZESTART => {
+            // Moving a framed floating window by hand ends the framing.
+            app.forget_framed(hwnd);
             if let Some(r) = visual_rect(hwnd) {
                 app.drag_start.insert(hwnd, r);
+                app.backdrop = Some(snapshot(work_area(monitor_of_window(hwnd))));
                 set_timer(app.hwnd, DRAG_TIMER, 16);
             }
             // A drag interrupts any motion in flight.
@@ -275,9 +326,11 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
         EVENT_SYSTEM_MOVESIZEEND => {
             kill_timer(app.hwnd, DRAG_TIMER);
             app.show_drop_zone(None);
+            app.backdrop = None;
             app.drag_ended(hwnd);
         }
         EVENT_SYSTEM_MINIMIZESTART => {
+            app.forget_framed(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
                 if let Some(p) = app.layouts[&m].placement_of(hwnd) {
                     app.minimized.insert(hwnd, (m, p));
@@ -294,6 +347,7 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
         }
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE => {
             app.minimized.remove(&hwnd);
+            app.forget_framed(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
                 app.undock(hwnd);
                 app.apply(m);
@@ -307,10 +361,9 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
 const DRAG_THRESHOLD: i32 = 6;
 
 /// With Snap off, Windows won't drag a maximized window at all. So Lattice
-/// watches for a press on a maximized window that starts to move, and
-/// restores it under the pointer to carry on as an ordinary drag. This runs
-/// inside the system mouse hook, so it only notes things down and posts the
-/// real work to itself.
+/// watches (via the mouse hook thread) for a press on a maximized window
+/// that starts to move, and restores it under the pointer to carry on as an
+/// ordinary drag.
 fn on_mouse(ev: MouseEvent, pt: (i32, i32)) {
     with_app(|app| match ev {
         MouseEvent::LeftDown => {
@@ -322,26 +375,25 @@ fn on_mouse(ev: MouseEvent, pt: (i32, i32)) {
             if let Some((w, at)) = app.press {
                 if (pt.0 - at.0).abs() + (pt.1 - at.1).abs() > DRAG_THRESHOLD {
                     app.press = None;
-                    app.restore_drag = Some((w, at));
-                    post_to_self(app.hwnd, WM_RESTORE_DRAG);
+                    restore_drag(w, at);
                 }
             }
         }
     });
 }
 
-impl App {
-    /// A press on a maximized window has started moving: if it was on the
-    /// title bar, and Windows isn't handling it (Snap off), restore the
-    /// window and drag it.
-    fn restore_drag(&mut self) {
-        let Some((w, grab)) = self.restore_drag.take() else { return };
-        if snap_enabled() || !left_button_down() || !is_maximized(w) || !on_title_bar(w, grab) {
-            return;
-        }
-        trace!("restore-drag {w:#x} grabbed at {grab:?}");
-        restore_and_drag(w, grab, cursor_pos());
+/// A press on maximized window `w` at `grab` has started moving: if it was
+/// on the title bar, and Windows isn't handling it (Snap off), restore the
+/// window and drag it.
+fn restore_drag(w: Hwnd, grab: (i32, i32)) {
+    if snap_enabled() || !left_button_down() || !is_maximized(w) || !on_title_bar(w, grab) {
+        return;
     }
+    trace!("restore-drag {w:#x} grabbed at {grab:?}");
+    restore_and_drag(w, grab, cursor_pos());
+}
+
+impl App {
 
     fn monitor_of(&self, id: WinId) -> Option<MonId> {
         self.layouts.iter().find(|(_, l)| l.contains(id)).map(|(m, _)| *m)
@@ -359,6 +411,37 @@ impl App {
         self.layouts.entry(mon).or_insert_with(|| Layout::new(GAP)).dock(id, edge, target);
         rescue_list_add(id);
         self.apply(mon);
+    }
+
+    /// Fill display `mon` with floating window `id`, remembering that it
+    /// was at `from`.
+    fn frame_float(&mut self, id: WinId, mon: MonId, from: Rect) {
+        self.unframe_float();
+        restore_if_maximized(id);
+        self.framed_float = Some((id, from));
+        self.animate(vec![(id, framed_rect(mon), true)]);
+    }
+
+    /// Put the framed floating window back where it was. False if none was.
+    fn unframe_float(&mut self) -> bool {
+        let Some((id, r)) = self.framed_float.take() else { return false };
+        if is_window(id) {
+            self.animate(vec![(id, r, true)]);
+        }
+        true
+    }
+
+    /// `id` has been moved some other way: it's no longer framed.
+    fn forget_framed(&mut self, id: WinId) {
+        if self.framed_float.is_some_and(|(f, _)| f == id) {
+            self.framed_float = None;
+        }
+    }
+
+    /// The display a window being dragged would fill if dropped now.
+    fn fullscreen_target(&self, hwnd: Hwnd, pt: (i32, i32)) -> Option<MonId> {
+        let mon = monitor_at(pt);
+        (is_manageable(hwnd) && fullscreen_drop(work_area(mon), pt.0, pt.1)).then_some(mon)
     }
 
     fn camera(&mut self, mon: MonId, f: impl FnOnce(&mut Layout)) {
@@ -393,10 +476,13 @@ impl App {
         self.dragging = hwnd;
         let Some(now) = visual_rect(hwnd) else { return };
         let resizing = (now.w - start.w).abs() > 2 || (now.h - start.h).abs() > 2;
+        let pt = cursor_pos();
         let zone = if resizing {
             None
+        } else if let Some(mon) = self.fullscreen_target(hwnd, pt) {
+            Some(framed_rect(mon))
         } else {
-            self.drop_target(hwnd, cursor_pos()).and_then(|(mon, target, edge)| {
+            self.drop_target(hwnd, pt).and_then(|(mon, target, edge)| {
                 let area = work_area(mon);
                 let l = self.layouts.get(&mon).cloned().unwrap_or_else(|| Layout::new(GAP));
                 l.preview(hwnd, edge, target, area)
@@ -406,20 +492,32 @@ impl App {
     }
 
     fn show_drop_zone(&mut self, zone: Option<Rect>) {
-        // Redraw when the zone moves, and every so often while it stays put,
-        // so the frost keeps up with what's underneath.
-        let stale = self.zone_drawn.is_none_or(|t| t.elapsed() >= ZONE_REFRESH);
-        if zone == self.drop_zone && (zone.is_none() || !stale) {
+        // Drawn once each time the zone moves, from the drag's backdrop.
+        if zone == self.drop_zone {
             return;
         }
-        self.drop_zone = zone;
-        match zone {
-            Some(r) => {
-                self.zone_drawn = Some(Instant::now());
-                show_overlay(self.overlay, r, &frosted(r), self.dragging);
-            }
-            None => hide_overlay(self.overlay),
+        let Some(r) = zone else {
+            self.drop_zone = None;
+            hide_overlay(self.overlay);
+            return;
+        };
+        let Some(slot) = self.backdrop.clone() else { return };
+        let guard = slot.lock().unwrap();
+        // Still capturing: try again next tick.
+        let Some(b) = guard.as_ref() else { return };
+        let a = b.area;
+        if r.x < a.x || r.y < a.y || r.x + r.w > a.x + a.w || r.y + r.h > a.y + a.h {
+            // The zone is on another display: snapshot that one instead.
+            drop(guard);
+            self.backdrop = Some(snapshot(work_area(monitor_at((r.x + r.w / 2, r.y + r.h / 2)))));
+            return;
         }
+        let t = Instant::now();
+        let px = frosted(r, b);
+        drop(guard);
+        show_overlay(self.overlay, r, &px, self.dragging);
+        self.drop_zone = zone;
+        trace!("drop zone {}x{} drawn in {:?}", r.w, r.h, t.elapsed());
     }
 
     fn drag_ended(&mut self, hwnd: Hwnd) {
@@ -438,6 +536,24 @@ impl App {
                     l.apply_resize(hwnd, now, area);
                 }
                 self.apply(m);
+            }
+            return;
+        }
+
+        // Dropped on the middle of the top: fill the display. A docked
+        // window is framed where it sits; any other floats framed, and
+        // stepping out puts it back where the drag began.
+        if let Some(mon) = self.fullscreen_target(hwnd, pt) {
+            trace!("drop fullscreen on {mon:#x}");
+            match docked_on {
+                Some(m) if m == mon => self.camera(m, |l| l.frame(hwnd)),
+                _ => {
+                    if let Some(m) = docked_on {
+                        self.undock(hwnd);
+                        self.apply(m);
+                    }
+                    self.frame_float(hwnd, mon, start);
+                }
             }
             return;
         }
@@ -538,6 +654,7 @@ impl App {
 
     /// Release every window: back to a normal desktop, nothing lost.
     fn float_all(&mut self) {
+        self.unframe_float();
         self.finish_anim();
         for (&m, l) in self.layouts.iter_mut() {
             l.zoom_all();
@@ -550,4 +667,11 @@ impl App {
         self.minimized.clear();
         rescue_list_clear();
     }
+}
+
+/// Where a window framed on its own sits on display `mon`: the work area,
+/// with the same margin a docked window framed there gets.
+fn framed_rect(mon: MonId) -> Rect {
+    let a = work_area(mon);
+    Rect::new(a.x + GAP / 2, a.y + GAP / 2, a.w - GAP, a.h - GAP)
 }

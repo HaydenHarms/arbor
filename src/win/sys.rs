@@ -3,6 +3,7 @@
 
 use crate::layout::Rect;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -35,8 +36,8 @@ pub use wm::{
     WM_RBUTTONUP, WM_TIMER,
 };
 pub const WM_TRAY: u32 = wm::WM_APP + 1;
-/// Posted to ourselves to take over dragging a maximized window.
-pub const WM_RESTORE_DRAG: u32 = wm::WM_APP + 2;
+/// Mouse events from the hook thread.
+pub const WM_MOUSE_HOOK: u32 = wm::WM_APP + 3;
 
 pub const VK_SPACE: u32 = 0x20;
 pub const VK_RETURN: u32 = 0x0D;
@@ -189,41 +190,59 @@ pub enum MouseEvent {
     Move,
 }
 
-type MouseFn = fn(MouseEvent, (i32, i32));
-static MOUSE_FN: Mutex<Option<MouseFn>> = Mutex::new(None);
+/// Where the hook thread posts mouse events: (window, message).
+static MOUSE_TARGET: Mutex<(Hwnd, u32)> = Mutex::new((0, 0));
+/// Whether the left button is down; moves only matter (and are only posted)
+/// while it is.
+static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn raw_mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let ev = match wp.0 as u32 {
-            wm::WM_LBUTTONDOWN => Some(MouseEvent::LeftDown),
-            wm::WM_LBUTTONUP => Some(MouseEvent::LeftUp),
-            wm::WM_MOUSEMOVE => Some(MouseEvent::Move),
+            wm::WM_LBUTTONDOWN => {
+                LEFT_DOWN.store(true, Ordering::Relaxed);
+                Some(MouseEvent::LeftDown)
+            }
+            wm::WM_LBUTTONUP => {
+                LEFT_DOWN.store(false, Ordering::Relaxed);
+                Some(MouseEvent::LeftUp)
+            }
+            wm::WM_MOUSEMOVE if LEFT_DOWN.load(Ordering::Relaxed) => Some(MouseEvent::Move),
             _ => None,
         };
-        let f = *MOUSE_FN.lock().unwrap();
-        if let (Some(ev), Some(f)) = (ev, f) {
+        if let (Some(ev), Ok(target)) = (ev, MOUSE_TARGET.try_lock()) {
             let info = &*(lp.0 as *const wm::MSLLHOOKSTRUCT);
-            f(ev, (info.pt.x, info.pt.y));
+            let packed = ((info.pt.x as u32 as u64) << 32) | info.pt.y as u32 as u64;
+            let _ = wm::PostMessageW(hwnd(target.0), target.1, WPARAM(ev as usize), LPARAM(packed as isize));
         }
     }
     wm::CallNextHookEx(None, code, wp, lp)
 }
 
-/// Watch the mouse system-wide. `f` must return quickly: Windows skips
-/// hooks that hold up input.
-pub fn install_mouse_hook(f: MouseFn) {
-    *MOUSE_FN.lock().unwrap() = Some(f);
-    unsafe {
+/// Watch the mouse system-wide, posting `msg` to window `h` for each left
+/// press, release, and move while pressed (decode with `mouse_message`).
+///
+/// The hook gets its own thread. Windows holds every mouse movement on the
+/// system until a low-level hook returns, so it must never wait behind
+/// Lattice's own work, like drawing the drop zone.
+pub fn install_mouse_hook(h: Hwnd, msg: u32) {
+    *MOUSE_TARGET.lock().unwrap() = (h, msg);
+    std::thread::spawn(|| unsafe {
         let inst = GetModuleHandleW(None).unwrap_or_default();
-        let _ = wm::SetWindowsHookExW(wm::WH_MOUSE_LL, Some(raw_mouse), inst, 0);
-    }
+        if wm::SetWindowsHookExW(wm::WH_MOUSE_LL, Some(raw_mouse), inst, 0).is_ok() {
+            let mut m = wm::MSG::default();
+            while wm::GetMessageW(&mut m, None, 0, 0).as_bool() {}
+        }
+    });
 }
 
-pub fn post_to_self(h: Hwnd, msg: u32) {
-    unsafe {
-        let _ = wm::PostMessageW(hwnd(h), msg, WPARAM(0), LPARAM(0));
-    }
+/// The event and point carried by a message from the mouse hook.
+pub fn mouse_message(wparam: usize, lparam: isize) -> Option<(MouseEvent, (i32, i32))> {
+    let ev = [MouseEvent::LeftDown, MouseEvent::LeftUp, MouseEvent::Move].into_iter().find(|e| *e as usize == wparam)?;
+    let p = lparam as u64;
+    Some((ev, ((p >> 32) as u32 as i32, p as u32 as i32)))
 }
+
 
 /// Whether Windows Snap is on. With it on, Windows itself lets you drag
 /// maximized windows; with it off, it doesn't.

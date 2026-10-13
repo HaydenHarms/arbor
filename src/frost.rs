@@ -26,6 +26,20 @@ fn pack([r, g, b]: [u32; 3]) -> u32 {
     0xff00_0000 | (r << 16) | (g << 8) | b
 }
 
+/// The cw×ch block at (x, y) of a w×h image, clamped to the image (edge
+/// pixels repeat where the block runs off it).
+pub fn crop(px: &[u32], w: usize, h: usize, x: isize, y: isize, cw: usize, ch: usize) -> Vec<u32> {
+    if w == 0 || h == 0 {
+        return vec![0; cw * ch];
+    }
+    let mut out = Vec::with_capacity(cw * ch);
+    for j in 0..ch as isize {
+        let sy = (y + j).clamp(0, h as isize - 1) as usize;
+        out.extend((0..cw as isize).map(|i| px[sy * w + (x + i).clamp(0, w as isize - 1) as usize]));
+    }
+    out
+}
+
 /// Blur in place: three box-blur passes each way, which together look
 /// close to a Gaussian.
 pub fn blur(px: &mut [u32], w: usize, h: usize, r: usize) {
@@ -72,24 +86,35 @@ pub fn compose(small: &[u32], sw: usize, sh: usize, w: usize, h: usize, style: &
     if sw == 0 || sh == 0 {
         return out;
     }
-    // Source coordinate (16.16 fixed point) for each output column/row.
+    // Source coordinate (8-bit fraction) for each output column/row.
     let map = |i: usize, from: usize, to: usize| -> (usize, usize, u32) {
-        let f = ((((i as f32 + 0.5) * from as f32 / to as f32) - 0.5).max(0.0) * 65536.0) as u32;
-        let i0 = ((f >> 16) as usize).min(from - 1);
-        (i0, (i0 + 1).min(from - 1), (f & 0xffff) >> 8)
+        let f = ((((i as f32 + 0.5) * from as f32 / to as f32) - 0.5).max(0.0) * 256.0) as u32;
+        let i0 = ((f >> 8) as usize).min(from - 1);
+        (i0, (i0 + 1).min(from - 1), f & 0xff)
     };
     let cols: Vec<_> = (0..w).map(|x| map(x, sw, w)).collect();
+    let src: Vec<[u32; 3]> = small.iter().map(|&p| channels(p)).collect();
     let keep = 255 - style.darken as u32;
+    // Only pixels this close to a side can be in a rounded corner or on the
+    // rim; everything further in is plain, opaque frost.
+    let band = (style.corner.ceil() as usize).max(2);
+    let mut row = vec![[0u32; 3]; sw];
     for y in 0..h {
+        // Blend the two source rows once, then each output pixel is a blend
+        // of two neighbours in that row.
         let (y0, y1, ty) = map(y, sh, h);
-        for (x, &(x0, x1, tx)) in cols.iter().enumerate() {
-            let [a, b, c, d] = [small[y0 * sw + x0], small[y0 * sw + x1], small[y1 * sw + x0], small[y1 * sw + x1]];
-            let mut rgb = [0u32; 3];
-            for (k, v) in rgb.iter_mut().enumerate() {
-                let (a, b, c, d) = (channels(a)[k], channels(b)[k], channels(c)[k], channels(d)[k]);
-                let top = a * (256 - tx) + b * tx;
-                let bottom = c * (256 - tx) + d * tx;
-                *v = ((top * (256 - ty) + bottom * ty) >> 16) * keep / 255;
+        for (i, v) in row.iter_mut().enumerate() {
+            let (a, b) = (src[y0 * sw + i], src[y1 * sw + i]);
+            *v = [0, 1, 2].map(|k| a[k] * (256 - ty) + b[k] * ty);
+        }
+        let edge_row = y < band || y + band >= h;
+        let line = &mut out[y * w..(y + 1) * w];
+        for (x, (&(x0, x1, tx), px)) in cols.iter().zip(line.iter_mut()).enumerate() {
+            let (a, b) = (row[x0], row[x1]);
+            let rgb = [0, 1, 2].map(|k| ((a[k] * (256 - tx) + b[k] * tx) >> 16) * keep / 255);
+            if !edge_row && x >= band && x + band < w {
+                *px = pack(rgb);
+                continue;
             }
             let (coverage, rim) = shape(x, y, w, h, style.corner);
             if coverage == 0.0 {
@@ -99,7 +124,7 @@ pub fn compose(small: &[u32], sw: usize, sh: usize, w: usize, h: usize, style: &
             let bw = style.border as f32 * rim / 255.0;
             let lit = rgb.map(|v| (v as f32 * (1.0 - bw) + 255.0 * bw) as u32);
             let alpha = (coverage * 255.0) as u32;
-            out[y * w + x] = (alpha << 24) | pack(lit.map(|v| v * alpha / 255)) & 0x00ff_ffff;
+            *px = (alpha << 24) | pack(lit.map(|v| v * alpha / 255)) & 0x00ff_ffff;
         }
     }
     out
@@ -128,6 +153,13 @@ mod tests {
     use super::*;
 
     const STYLE: Style = Style { blur: 2, darken: 0, corner: 8.0, border: 0 };
+
+    #[test]
+    fn crop_takes_a_block_and_clamps_at_the_edges() {
+        let px: Vec<u32> = (0..12).collect(); // 4×3, values = index
+        assert_eq!(crop(&px, 4, 3, 1, 1, 2, 2), vec![5, 6, 9, 10]);
+        assert_eq!(crop(&px, 4, 3, -1, 2, 2, 2), vec![8, 8, 8, 8]);
+    }
 
     #[test]
     fn blur_keeps_a_flat_image_flat() {

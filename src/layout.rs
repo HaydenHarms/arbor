@@ -592,6 +592,10 @@ impl Layout {
         py: i32,
         exclude: WinId,
     ) -> Option<(Option<WinId>, Edge)> {
+        // The middle of the top fills the display rather than docking.
+        if fullscreen_drop(area, px, py) {
+            return None;
+        }
         if let Some(edge) = screen_edge(area, px, py) {
             // Near either end of a side, stack against the window in that
             // corner instead of taking the whole side: top or bottom of a
@@ -678,6 +682,13 @@ impl Layout {
         l.dock(id, edge, target);
         l.layout(area).into_iter().find(|(w, _)| *w == id).map(|(_, r)| r)
     }
+}
+
+/// Whether a drop at (px, py) fills the display: pressed against the top,
+/// away from its ends (which stack or dock to the top as usual).
+pub fn fullscreen_drop(area: Rect, px: i32, py: i32) -> bool {
+    let along = (px - area.x) as f32 / area.w as f32;
+    py <= area.y + 2 && (CORNER..=1.0 - CORNER).contains(&along)
 }
 
 /// Which side of the display a drop at (px, py) docks against, if any.
@@ -869,8 +880,19 @@ mod tests {
     #[test]
     fn top_docks_only_when_pressed_against_it() {
         let l = Layout::new(0);
-        assert_eq!(l.dock_target(AREA, 500, 0, 9), Some((None, Edge::Top)));
-        assert_eq!(l.dock_target(AREA, 500, 15, 9), None);
+        assert_eq!(l.dock_target(AREA, 150, 0, 9), Some((None, Edge::Top)));
+        assert_eq!(l.dock_target(AREA, 150, 15, 9), None);
+    }
+
+    #[test]
+    fn middle_of_the_top_fills_the_display() {
+        let l = Layout::new(0);
+        assert!(fullscreen_drop(AREA, 500, 0));
+        assert!(fullscreen_drop(AREA, 260, 2));
+        assert_eq!(l.dock_target(AREA, 500, 0, 9), None, "not a dock");
+        assert!(!fullscreen_drop(AREA, 500, 15), "only pressed against the top");
+        assert!(!fullscreen_drop(AREA, 100, 0), "the ends still dock");
+        assert!(!fullscreen_drop(AREA, 900, 0));
     }
 
     #[test]
