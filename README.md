@@ -24,7 +24,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 - While you drag, a frosted panel shows exactly where the window will land. No panel means it will float where you drop it.
 - Drag a window by its title bar until the pointer meets a screen edge to dock it there. The first window takes that half of the screen; the next fills the other half.
 - Near either end of an edge, it stacks instead: top or bottom of the right edge puts it above or below what's docked on the right, and the ends of the top or bottom edge put it beside what's docked there.
-- Push a window against the middle of the top edge to fill the screen with it. A docked window is framed where it sits; a floating one comes back to where you picked it up when you step out (`Ctrl+Alt+Space`, `Ctrl+Alt+Up` or `Ctrl+Alt+[`).
+- Push a window against the middle of the top edge to fill the screen with it. A docked window is framed where it sits; a floating one comes back to where you picked it up when you step out (`Ctrl+Alt+Space` or `Ctrl+Alt+Up`).
 - Drop it near the edge of a docked window to split that window's space.
 - Drop it on a docked window's title bar to make them tabs, or hold Shift and drop it anywhere on the window. They share that spot under a strip of tabs, and only the picked one shows. Drop more windows on the strip to add tabs.
 - Drop it in the middle of the screen or of any window and it floats. Drop a docked window there to float it again.
@@ -55,8 +55,6 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 | `Ctrl+Alt+Up` | Step out a level (past everything: the overview) |
 | `Ctrl+Alt+Down` | Step in toward the window under the pointer |
 | `Ctrl+Alt+Enter` | Frame the active window on its own, docked or floating (again to put a floating one back) |
-| `Ctrl+Alt+Left` / `Right` | Move to the neighbouring space |
-| `Ctrl+Alt+[` / `]` | Back / forward |
 | `Ctrl+Alt+Page Up` / `Page Down` | Previous / next tab in the active window's group |
 | `Ctrl+Alt+Shift+Arrow` | Dock the active window at that edge |
 | `Ctrl+Alt+F` | Float or dock the active window |

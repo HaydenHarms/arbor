@@ -267,10 +267,6 @@ enum Cmd {
     ZoomOut,
     ZoomIn,
     Frame,
-    Prev,
-    Next,
-    Back,
-    Forward,
     Dock(Edge),
     PrevTab,
     NextTab,
@@ -281,15 +277,11 @@ enum Cmd {
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 18] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 14] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::ZoomOut, Mods::CtrlAlt, VK_UP, "Ctrl+Alt+Up  step out a level"),
     (Cmd::ZoomIn, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  step in toward the pointer"),
     (Cmd::Frame, Mods::CtrlAlt, VK_RETURN, "Ctrl+Alt+Enter  frame a window on its own"),
-    (Cmd::Prev, Mods::CtrlAlt, VK_LEFT, "Ctrl+Alt+Left  previous space"),
-    (Cmd::Next, Mods::CtrlAlt, VK_RIGHT, "Ctrl+Alt+Right  next space"),
-    (Cmd::Back, Mods::CtrlAlt, VK_OEM_4, "Ctrl+Alt+[  back"),
-    (Cmd::Forward, Mods::CtrlAlt, VK_OEM_6, "Ctrl+Alt+]  forward"),
     (Cmd::Dock(Edge::Left), Mods::CtrlAltShift, VK_LEFT, "Ctrl+Alt+Shift+Left  dock left"),
     (Cmd::Dock(Edge::Right), Mods::CtrlAltShift, VK_RIGHT, "Ctrl+Alt+Shift+Right  dock right"),
     (Cmd::Dock(Edge::Top), Mods::CtrlAltShift, VK_UP, "Ctrl+Alt+Shift+Up  dock top"),
@@ -412,11 +404,8 @@ fn run_cmd(cmd: Cmd) {
         // Already showing everything: step out once more, to the overview.
         let at_top = app.layouts.get(&mon).is_some_and(|l| l.camera.is_empty());
         // Every camera motion first puts a framed floating window back;
-        // stepping out (or back) does only that.
-        let framed = matches!(
-            cmd,
-            Cmd::ShowAll | Cmd::ZoomOut | Cmd::ZoomIn | Cmd::Prev | Cmd::Next | Cmd::Back | Cmd::Forward
-        ) && app.unframe_float();
+        // stepping out does only that.
+        let framed = matches!(cmd, Cmd::ShowAll | Cmd::ZoomOut | Cmd::ZoomIn) && app.unframe_float();
         match cmd {
             Cmd::ShowAll | Cmd::ZoomOut if at_top && !framed => app.open_overview(mon),
             Cmd::ShowAll => app.camera(mon, |l| l.zoom_all()),
@@ -440,11 +429,7 @@ fn run_cmd(cmd: Cmd) {
                     }
                 }
             }
-            Cmd::Prev => app.camera(mon, |l| l.neighbour(-1)),
-            Cmd::Next => app.camera(mon, |l| l.neighbour(1)),
-            Cmd::Back if !framed => app.camera(mon, |l| l.back()),
-            Cmd::Forward => app.camera(mon, |l| l.forward()),
-            Cmd::ZoomOut | Cmd::Back => {}
+            Cmd::ZoomOut => {}
             Cmd::PrevTab | Cmd::NextTab => {
                 let dir = if matches!(cmd, Cmd::NextTab) { 1 } else { -1 };
                 let next = app.monitor_of(fg).and_then(|m| app.layouts[&m].tab_beside(fg, dir));

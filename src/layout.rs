@@ -252,9 +252,6 @@ pub struct Layout {
     pub gap: i32,
     /// Height of a tab group's strip of tabs, in pixels.
     pub tab_bar: i32,
-    /// Back/forward history of camera positions.
-    back: Vec<Vec<usize>>,
-    forward: Vec<Vec<usize>>,
     groups: Vec<Group>,
 }
 
@@ -526,8 +523,6 @@ impl Layout {
         while !valid(&self.camera, &self.root) && !self.camera.is_empty() {
             self.camera.pop();
         }
-        self.back.retain(|p| valid(p, &self.root));
-        self.forward.retain(|p| valid(p, &self.root));
     }
 
     /// Rects for every window, given the display's work area. Windows inside
@@ -612,10 +607,7 @@ impl Layout {
     }
 
     fn move_camera(&mut self, to: Vec<usize>) {
-        if to != self.camera {
-            self.back.push(std::mem::replace(&mut self.camera, to));
-            self.forward.clear();
-        }
+        self.camera = to;
     }
 
     /// Frame the smallest node containing `id` that isn't just the leaf itself:
@@ -647,33 +639,6 @@ impl Layout {
     /// Show everything.
     pub fn zoom_all(&mut self) {
         self.move_camera(Vec::new());
-    }
-
-    /// Move the camera to the neighbouring sibling (dir = -1 or +1).
-    pub fn neighbour(&mut self, dir: i32) {
-        let Some((&i, parent)) = self.camera.split_last() else { return };
-        let Some(Node::Split { children, .. }) = self.root.as_ref().and_then(|r| r.at_path(parent)) else {
-            return;
-        };
-        let j = i as i32 + dir;
-        // Nothing to look at in the empty space, so never frame it.
-        if j >= 0 && (j as usize) < children.len() && children[j as usize] != Node::Leaf(EMPTY) {
-            let mut p = parent.to_vec();
-            p.push(j as usize);
-            self.move_camera(p);
-        }
-    }
-
-    pub fn back(&mut self) {
-        if let Some(p) = self.back.pop() {
-            self.forward.push(std::mem::replace(&mut self.camera, p));
-        }
-    }
-
-    pub fn forward(&mut self) {
-        if let Some(p) = self.forward.pop() {
-            self.back.push(std::mem::replace(&mut self.camera, p));
-        }
     }
 
     /// The user resized `id` to `new` by dragging its border. Move the seam(s)
@@ -1096,7 +1061,6 @@ mod tests {
         l.frame(EMPTY);
         assert!(l.camera.is_empty());
         l.frame(1);
-        l.neighbour(1);
         assert!(l.is_visible(1));
     }
 
@@ -1238,10 +1202,6 @@ mod tests {
         assert!(l.is_visible(2) && !l.is_visible(1));
         l.zoom_out();
         assert_eq!(rect_of(&l, 2), Rect::new(500, 0, 500, 600));
-        l.back();
-        assert_eq!(rect_of(&l, 2), AREA);
-        l.forward();
-        assert!(l.camera.is_empty());
     }
 
     #[test]
@@ -1299,18 +1259,6 @@ mod tests {
         assert_eq!(l.dock_target(AREA, 520, 300, 9), Some((Some(2), Edge::Left)));
         assert_eq!(l.dock_target(AREA, 750, 580, 9), Some((None, Edge::Bottom)));
         assert_eq!(l.dock_target(AREA, 750, 300, 9), None);
-    }
-
-    #[test]
-    fn neighbour_moves_between_siblings() {
-        let mut l = Layout::new(0);
-        l.dock(1, Edge::Left, None);
-        l.dock(2, Edge::Right, None);
-        l.frame(1);
-        l.neighbour(1);
-        assert!(l.is_visible(2) && !l.is_visible(1));
-        l.neighbour(1); // no further sibling: stays put
-        assert!(l.is_visible(2));
     }
 
     #[test]
