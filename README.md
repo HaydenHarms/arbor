@@ -15,7 +15,7 @@ cargo build --release
 .\target\release\lattice.exe
 ```
 
-Lattice lives in the system tray. Right-click the icon to show everything, open the overview, float every window, or quit.
+Lattice lives in the system tray. Right-click the icon to show everything, open the overview or your templates, float every window, or quit.
 
 ## Using it
 
@@ -40,6 +40,17 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 - Tabs work with any app, because Lattice only moves windows. It never puts one app's window inside another's.
 - Switching to a hidden tab with Alt+Tab or the taskbar shows it. The same goes for any docked window zoomed out of view: Lattice steps out until it's in view.
 
+**Templates**
+
+- Once your windows are docked how you like, open the **Templates** tab in the bottom-right corner (or press `Ctrl+Alt+T`), click *Save the current layout as a template* and give it a name.
+- Click a template to fit the windows on the active display into that shape. Lattice keeps it loose:
+  - Each window goes back to the spot its app had when you saved, if it can. The rest fill the spots in reading order, left to right and top to bottom.
+  - Too few windows? Docked ones go first, then floating ones on that display. Spots nobody fills close up, and the windows beside them take the space.
+  - Too many? Docked windows left over become tabs in the last spot, so nothing goes missing. Floating windows are only pulled in to fill spots.
+  - Tab groups move as one.
+- Click the ✕ beside a template to delete it. Saving under a name that's already taken replaces that template.
+- Templates are kept in `%LOCALAPPDATA%\Lattice\templates.txt`, so they survive restarts.
+
 **Overview**
 
 - Press `Ctrl+Alt+Space` when everything is already showing and the whole arrangement steps back into the overview: every docked window as a card with a live picture of it, in the same layout, without moving or resizing the windows themselves.
@@ -59,6 +70,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 | `Ctrl+Alt+F` | Float the active window in the middle of the screen, or put it back where it was: docked, or filling the screen |
 | `Ctrl+Alt+Down` | Minimize the active window (restoring it puts it back in its spot) |
 | `Ctrl+Alt+C` | Bring back the last minimized window (again for the one before) |
+| `Ctrl+Alt+T` | Open or close your templates (also the Templates tab in the bottom-right corner) |
 | `Ctrl+Alt+/` | Open or close the list of shortcuts (also the Keys tab in the bottom-right corner) |
 | `Ctrl+Alt+Shift+Q` | Quit |
 
@@ -74,6 +86,7 @@ Each display keeps its own arrangement and camera.
 ## How it works
 
 - `src/layout.rs` is the layout engine. It's pure Rust with no Windows code, and unit-tested. The desktop is a tree: leaves are windows, splits divide space by weight. The camera is a path into the tree, and zooming maps that node's rect onto the screen. Windows outside it land off-screen and are parked. A leaf can hold a tab group: the tree holds the showing tab, and the rest are parked behind it.
+- `src/template.rs` saves and reads templates, and decides which window goes in which spot. It's pure Rust and unit-tested too.
 - `src/win/` is the Windows layer. It hooks window events (`SetWinEventHook`) for drags, minimizes and closes, registers global hotkeys, and moves windows with async `SetWindowPos`, so a hung app can never freeze Lattice. Placement accounts for the invisible resize borders on Windows 10/11, so gaps are exact.
 
 ```powershell

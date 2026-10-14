@@ -11,6 +11,8 @@
 //! A leaf can also hold a group of windows as tabs: they share the leaf's
 //! space under a strip of tabs, and only the one picked shows.
 
+use crate::template::Shape;
+
 pub type WinId = isize;
 
 /// The share of a display side, at each end, where a drop stacks against
@@ -743,6 +745,99 @@ impl Layout {
                 weights[idx] += dw;
                 weights[nb] -= dw;
                 break;
+            }
+        }
+    }
+
+    /// The windows standing in the tree's spots (a group's showing tab), in
+    /// reading order.
+    pub fn leaves(&self) -> Vec<WinId> {
+        let mut out = Vec::new();
+        if let Some(r) = &self.root {
+            r.leaves(&mut out);
+        }
+        out.retain(|&w| w != EMPTY);
+        out
+    }
+
+    /// The arrangement's shape, to save as a template: every spot, with the
+    /// app `app` names for the window there. None if nothing is docked.
+    pub fn shape(&self, app: impl Fn(WinId) -> String) -> Option<Shape> {
+        fn of(n: &Node, app: &impl Fn(WinId) -> String) -> Shape {
+            match n {
+                Node::Leaf(EMPTY) => Shape::Slot(None),
+                Node::Leaf(w) => Shape::Slot(Some(app(*w)).filter(|a| !a.is_empty())),
+                Node::Split { axis, children, weights } => Shape::Split {
+                    axis: *axis,
+                    children: children.iter().map(|c| of(c, app)).collect(),
+                    weights: weights.clone(),
+                },
+            }
+        }
+        self.root.as_ref().map(|r| of(r, &app))
+    }
+
+    /// Rearrange into `shape`, showing everything. Slot i (in reading
+    /// order) gets window `fill[i]`; slots with none close up. Tab groups
+    /// stay with their showing tab. The `extra` windows, and any docked
+    /// window not given a slot, join the last spot as tabs, groups and all.
+    pub fn arrange(&mut self, shape: &Shape, fill: &[Option<WinId>], extra: &[WinId]) {
+        fn build(s: &Shape, fill: &mut impl Iterator<Item = Option<WinId>>) -> Option<Node> {
+            match s {
+                Shape::Slot(_) => fill.next().flatten().filter(|&w| w != EMPTY).map(Node::Leaf),
+                Shape::Split { axis, children, weights } => {
+                    let built: Vec<_> = children.iter().map(|c| build(c, fill)).collect();
+                    let (mut kept, mut kept_w) = (Vec::new(), Vec::new());
+                    for (c, w) in built.into_iter().zip(weights) {
+                        if let Some(c) = c {
+                            kept.push(c);
+                            kept_w.push(*w);
+                        }
+                    }
+                    match kept.len() {
+                        0 => None,
+                        1 => kept.pop(),
+                        _ => {
+                            let mut n = Node::Split { axis: *axis, children: kept, weights: kept_w };
+                            n.flatten();
+                            Some(n)
+                        }
+                    }
+                }
+            }
+        }
+        let placed: Vec<WinId> = fill.iter().flatten().copied().filter(|&w| w != EMPTY).collect();
+        let mut extra: Vec<WinId> = extra.to_vec();
+        for w in self.leaves() {
+            if !extra.contains(&w) {
+                extra.push(w);
+            }
+        }
+        extra.retain(|w| *w != EMPTY && !placed.contains(w));
+        let mut root = build(shape, &mut fill.iter().copied());
+        if root.is_none() && !extra.is_empty() {
+            root = Some(Node::Leaf(extra.remove(0)));
+        }
+        self.root = root;
+        self.camera.clear();
+        let mut leaves = Vec::new();
+        if let Some(r) = &self.root {
+            r.leaves(&mut leaves);
+        }
+        let Some(&last) = leaves.last() else { return };
+        for e in extra {
+            let wins = match self.group_of(e) {
+                Some(g) => self.groups.remove(g).wins,
+                None => vec![e],
+            };
+            let g = self.group_of(last).unwrap_or_else(|| {
+                self.groups.push(Group { wins: vec![last], active: 0 });
+                self.groups.len() - 1
+            });
+            for w in wins {
+                if !self.groups[g].wins.contains(&w) {
+                    self.groups[g].wins.push(w);
+                }
             }
         }
     }
@@ -1560,4 +1655,67 @@ mod tests {
         assert_eq!(ease(1.0), 1.0);
         assert!((ease(0.5) - 0.5).abs() < 1e-6);
     }
+
+    #[test]
+    fn template_round_trip_through_shape_and_arrange() {
+        // 1 | (2 over 3), the left a bit wider.
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        l.dock(3, Edge::Bottom, Some(2));
+        l.tab(4, 2);
+        let shape = l.shape(|w| format!("app{w}")).unwrap();
+        assert_eq!(shape.hints(), vec![Some("app1".into()), Some("app4".into()), Some("app3".into())]);
+
+        // Fit other windows in: same spots, same group kept with its tab.
+        let mut m = Layout::new(0);
+        m.dock(7, Edge::Top, None);
+        m.dock(8, Edge::Bottom, None);
+        m.tab(9, 8);
+        m.camera = vec![0];
+        m.arrange(&shape, &[Some(9), Some(10), Some(7)], &[]);
+        assert!(m.camera.is_empty());
+        assert_eq!(m.leaves(), vec![9, 10, 7]);
+        assert_eq!(rect_of(&m, 10), Rect::new(500, 0, 500, 300));
+        assert_eq!(m.group(9).unwrap().wins, vec![8, 9]);
+        assert!(m.contains(8));
+    }
+
+    #[test]
+    fn arrange_with_too_few_and_too_many_windows() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        l.dock(3, Edge::Bottom, Some(2));
+        let shape = l.shape(|_| String::new()).unwrap();
+
+        // Too few: the empty spots close up.
+        let mut m = Layout::new(0);
+        m.dock(5, Edge::Left, None);
+        m.arrange(&shape, &[None, Some(5), None], &[]);
+        assert_eq!(m.leaves(), vec![5]);
+        assert_eq!(rect_of(&m, 5), AREA);
+
+        // Too many: the rest, and any docked window not placed, join the
+        // last spot as tabs, groups and all.
+        let mut m = Layout::new(0);
+        for w in [5, 6, 7, 8] {
+            m.dock(w, Edge::Right, None);
+        }
+        m.tab(9, 8);
+        m.arrange(&shape, &[Some(5), Some(6), Some(7)], &[9]);
+        assert_eq!(m.leaves(), vec![5, 6, 7]);
+        let g = m.group(7).unwrap();
+        assert_eq!((g.shown(), g.wins.len()), (7, 3));
+        assert!(g.wins.contains(&8) && g.wins.contains(&9));
+
+        // Nothing for any slot: what's docked stays docked.
+        let mut m = Layout::new(0);
+        m.dock(5, Edge::Left, None);
+        m.dock(6, Edge::Right, None);
+        m.arrange(&shape, &[None, None, None], &[]);
+        assert_eq!(m.leaves(), vec![5]);
+        assert!(m.group(5).is_some_and(|g| g.wins == vec![5, 6]));
+    }
+
 }

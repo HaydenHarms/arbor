@@ -4,6 +4,7 @@
 mod sys;
 
 use crate::frost;
+use crate::template::{self, Template};
 use crate::layout::{
     card_parts, centred, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Group, Layout,
     Placement, Rect, WinId, TITLE_ZONE,
@@ -223,6 +224,8 @@ struct App {
     overview: Option<Overview>,
     /// Apps' colours, from their icons, for their cards in the overview.
     tints: HashMap<WinId, Option<u32>>,
+    /// Saved templates, as the panel lists them.
+    templates: Vec<Template>,
 }
 
 thread_local! {
@@ -239,11 +242,20 @@ macro_rules! trace {
     };
 }
 
+/// Where Lattice keeps its files: `%LOCALAPPDATA%\Lattice`.
+fn data_dir() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Lattice");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+fn templates_file() -> Option<std::path::PathBuf> {
+    data_dir().map(|d| d.join("templates.txt"))
+}
+
 fn trace_line(s: &str) {
     use std::io::Write;
-    let Some(dir) = std::env::var_os("LOCALAPPDATA") else { return };
-    let dir = std::path::PathBuf::from(dir).join("Lattice");
-    let _ = std::fs::create_dir_all(&dir);
+    let Some(dir) = data_dir() else { return };
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("lattice.log")) {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let _ = writeln!(f, "{}.{:03} {s}", t.as_secs(), t.subsec_millis());
@@ -275,6 +287,7 @@ pub fn run() {
     install_mouse_hook(hwnd, WM_MOUSE_HOOK);
     on_strip_input(on_strip);
     on_overview_input(|ev, pt| with_app(|app| app.overview_input(ev, pt)));
+    on_template_input(|ev| with_app(|app| app.template_input(ev)));
     let overlay = create_overlay();
     let main = monitor_at((0, 0));
     let keys = create_keys(shortcut_rows(), work_area(main), monitor_scale(main));
@@ -282,6 +295,11 @@ pub fn run() {
         app.hwnd = hwnd;
         app.overlay = overlay;
         app.keys = keys;
+        app.templates = templates_file()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| template::parse_file(&t))
+            .unwrap_or_default();
+        app.show_templates();
     });
     if !failed.is_empty() {
         message_box(
@@ -310,11 +328,12 @@ enum Cmd {
     Minimize,
     Unminimize,
     Keys,
+    Templates,
     FloatAll,
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 13] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 14] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::Frame, Mods::CtrlAlt, VK_RETURN, "Ctrl+Alt+Enter  frame a window on its own"),
     (Cmd::Dock(Edge::Left), Mods::CtrlAltShift, VK_LEFT, "Ctrl+Alt+Shift+Left  dock left"),
@@ -326,6 +345,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 13] = [
     (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float in the middle / put back"),
     (Cmd::Minimize, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  minimize"),
     (Cmd::Unminimize, Mods::CtrlAlt, VK_C, "Ctrl+Alt+C  bring back the last minimized window"),
+    (Cmd::Templates, Mods::CtrlAlt, VK_T, "Ctrl+Alt+T  show or hide your templates"),
     (Cmd::Keys, Mods::CtrlAlt, VK_OEM_2, "Ctrl+Alt+/  show or hide these shortcuts"),
     (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
@@ -356,6 +376,7 @@ const MENU_SHOW_ALL: usize = 100;
 const MENU_OVERVIEW: usize = 103;
 const MENU_FLOAT_ALL: usize = 101;
 const MENU_QUIT: usize = 102;
+const MENU_TEMPLATES: usize = 104;
 
 fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
     match msg {
@@ -391,6 +412,7 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
                     &[
                         (MENU_SHOW_ALL, "Show everything"),
                         (MENU_OVERVIEW, "Overview"),
+                        (MENU_TEMPLATES, "Templates"),
                         (MENU_FLOAT_ALL, "Float all windows"),
                         (0, ""),
                         (MENU_QUIT, "Quit Lattice"),
@@ -402,6 +424,7 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
                         app.unframe_float();
                         app.open_overview(monitor_at(cursor_pos()));
                     }),
+                    MENU_TEMPLATES => run_cmd(Cmd::Templates),
                     MENU_FLOAT_ALL => run_cmd(Cmd::FloatAll),
                     MENU_QUIT => run_cmd(Cmd::Quit),
                     _ => {}
@@ -516,7 +539,8 @@ fn run_cmd(cmd: Cmd) {
                     }
                 }
             }
-            Cmd::Keys => toggle_keys(app.keys),
+            Cmd::Keys => toggle_page(app.keys, Page::Keys),
+            Cmd::Templates => toggle_page(app.keys, Page::Templates),
             Cmd::FloatAll => app.float_all(),
             Cmd::Quit => {
                 app.float_all();
@@ -1586,6 +1610,130 @@ impl App {
             // Gone to another window (Alt+Tab, the taskbar): step back in.
             OverviewEvent::Away => self.close_overview(0, |_| {}),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Templates
+
+    fn template_input(&mut self, ev: TemplateEvent) {
+        match ev {
+            TemplateEvent::Apply(i) => self.apply_template(i),
+            TemplateEvent::Delete(i) => {
+                if i < self.templates.len() {
+                    self.templates.remove(i);
+                    self.save_templates();
+                }
+            }
+            TemplateEvent::Save(name) => self.save_template(&name),
+        }
+    }
+
+    /// The display templates act on: the active window's.
+    fn template_display(&self) -> MonId {
+        let w = self.last_fg;
+        if is_window(w) && !is_minimized(w) {
+            self.monitor_of(w).unwrap_or_else(|| monitor_of_window(w))
+        } else {
+            monitor_at(cursor_pos())
+        }
+    }
+
+    /// Save the arrangement on the active display as template `name`,
+    /// replacing any of that name.
+    fn save_template(&mut self, name: &str) {
+        let mon = self.template_display();
+        let shape = self.layouts.get(&mon).and_then(|l| l.shape(|w| template::app_key(&window_exe(w))));
+        let back = self.last_fg;
+        let Some(shape) = shape else {
+            message_box("Lattice", "Nothing is docked on this display yet. Dock your windows how you like, then save.");
+            return;
+        };
+        let name = template::clean_name(name);
+        trace!("save template {name:?}: {}", shape.to_text());
+        let t = Template { name, shape };
+        match self.templates.iter().position(|o| o.name.eq_ignore_ascii_case(&t.name)) {
+            Some(i) => self.templates[i] = t,
+            None => self.templates.push(t),
+        }
+        self.save_templates();
+        if is_window(back) {
+            set_foreground(back);
+        }
+    }
+
+    /// Write the templates out, and show them on the panel.
+    fn save_templates(&mut self) {
+        if let Some(f) = templates_file() {
+            if let Err(e) = std::fs::write(&f, template::to_file(&self.templates)) {
+                trace!("couldn't save templates: {e}");
+            }
+        }
+        self.show_templates();
+    }
+
+    fn show_templates(&self) {
+        let square = Rect::new(0, 0, 1000, 1000);
+        let rows = self
+            .templates
+            .iter()
+            .map(|t| TemplateRow { name: t.name.clone(), slots: t.shape.rects(square) })
+            .collect();
+        set_templates(self.keys, rows);
+    }
+
+    /// Fit the windows on the active display into template `i`. The docked
+    /// ones go first, each to its app's old spot if it has one; floating
+    /// ones there, front to back, fill any spots left. Spots nobody fills
+    /// close up; docked windows left over join the last spot as tabs.
+    fn apply_template(&mut self, i: usize) {
+        let Some(t) = self.templates.get(i).cloned() else { return };
+        if let Some(back) = self.overview.as_ref().map(|o| o.return_to) {
+            self.end_overview(back);
+        }
+        self.unframe_float();
+        self.finish_anim();
+        let mon = self.template_display();
+        let hints = t.shape.hints();
+        let docked = self.layouts.get(&mon).map(|l| l.leaves()).unwrap_or_default();
+        let mut wins: Vec<(WinId, String)> =
+            docked.iter().map(|&w| (w, template::app_key(&window_exe(w)))).collect();
+        for w in windows_front_to_back() {
+            if wins.len() >= hints.len() {
+                break;
+            }
+            let showing = is_manageable(w)
+                && !is_minimized(w)
+                && self.monitor_of(w).is_none()
+                && monitor_of_window(w) == mon
+                && visual_rect(w).is_some_and(|r| r.x > -20_000)
+                && self.float_group(w).is_none_or(|g| self.float_groups[g].tabs.shown() == w);
+            if showing {
+                wins.push((w, template::app_key(&window_exe(w))));
+            }
+        }
+        let (fill, extra) = template::assign(&hints, &wins);
+        trace!("apply template {:?} on {mon:#x}: {fill:?}, extra {extra:?}", t.name);
+        // Floating windows joining bring their tab groups.
+        let mut groups = Vec::new();
+        for &w in fill.iter().flatten() {
+            if self.monitor_of(w).is_some() {
+                continue;
+            }
+            self.forget_framed(w);
+            self.floated.remove(&w);
+            restore_if_maximized(w);
+            rescue_list_add(w);
+            groups.extend(self.take_group(w));
+        }
+        let l = self.layouts.entry(mon).or_insert_with(|| new_layout(mon));
+        l.arrange(&t.shape, &fill, &extra);
+        for g in groups {
+            for &w in &g.wins {
+                rescue_list_add(w);
+            }
+            l.put_group(g);
+        }
+        self.apply(mon);
     }
 
     /// Release every window: back to a normal desktop, nothing lost.

@@ -5,9 +5,9 @@ use crate::layout::Rect;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, BOOL, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    CloseHandle, GetLastError, BOOL, COLORREF, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmRegisterThumbnail, DwmSetWindowAttribute, DwmUnregisterThumbnail,
@@ -25,7 +25,9 @@ use windows::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{
@@ -33,7 +35,8 @@ use windows::Win32::UI::HiDpi::{
     MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+    GetAsyncKeyState, GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
+    TRACKMOUSEEVENT, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
     MOD_NOREPEAT, MOD_SHIFT, VK_LBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
@@ -63,6 +66,7 @@ pub const VK_PRIOR: u32 = 0x21; // Page Up
 pub const VK_NEXT: u32 = 0x22; // Page Down
 pub const VK_ESCAPE: u32 = 0x1B;
 pub const VK_C: u32 = 0x43;
+pub const VK_T: u32 = 0x54;
 pub const VK_F: u32 = 0x46;
 pub const VK_Q: u32 = 0x51;
 
@@ -1458,39 +1462,226 @@ pub fn install_rescue_hook() {
 }
 
 // ---------------------------------------------------------------------------
-// Shortcuts panel: a little tab in the corner of the screen that opens into
-// a list of Lattice's shortcuts.
+// Corner panel: two little tabs in the corner of the main display, Templates
+// and Keys, each opening into a page: the saved templates, or Lattice's
+// shortcuts.
 
-struct KeysData {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    Templates,
+    Keys,
+}
+
+/// A saved template as the panel lists it: its name, and its spots laid
+/// out in a 1000×1000 square, for a little picture.
+pub struct TemplateRow {
+    pub name: String,
+    pub slots: Vec<Rect>,
+}
+
+/// What the user did on the Templates page.
+#[derive(Clone, Debug)]
+pub enum TemplateEvent {
+    Apply(usize),
+    Delete(usize),
+    Save(String),
+}
+
+/// Something on the panel that a click does something with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hit {
+    Tab(Page),
+    Apply(usize),
+    Delete(usize),
+    Save,
+}
+
+struct PanelData {
     /// (keys, what they do). A row with no keys is a heading.
     rows: Vec<(String, String)>,
-    open: bool,
+    templates: Vec<TemplateRow>,
+    open: Option<Page>,
+    hover: Option<Hit>,
+    /// The name being typed for a new template.
+    naming: Option<String>,
     area: Rect,
     scale: f32,
 }
 
-static KEYS: Mutex<KeysData> =
-    Mutex::new(KeysData { rows: Vec::new(), open: false, area: Rect::new(0, 0, 0, 0), scale: 1.0 });
+static PANEL: Mutex<PanelData> = Mutex::new(PanelData {
+    rows: Vec::new(),
+    templates: Vec::new(),
+    open: None,
+    hover: None,
+    naming: None,
+    area: Rect::new(0, 0, 0, 0),
+    scale: 1.0,
+});
 
-/// Keeps the tab above other always-on-top windows, and out of the way of
+type TemplateFn = fn(TemplateEvent);
+static TEMPLATE_FN: Mutex<Option<TemplateFn>> = Mutex::new(None);
+
+/// Keeps the panel above other always-on-top windows, and out of the way of
 /// full-screen ones.
 const KEYS_TIMER: usize = 1;
+/// The tabs along the bottom, at 96 DPI: Templates, then Keys in the corner.
+const TEMPLATES_TAB: f32 = 104.0;
 const KEYS_TAB: (f32, f32) = (76.0, 26.0);
 const KEYS_WIDTH: f32 = 430.0;
 const KEYS_ROW: f32 = 22.0;
 const KEYS_PAD: f32 = 12.0;
 const KEYS_KEY_COLUMN: f32 = 170.0;
+/// A template's row, its picture, and the button that saves a new one.
+const TEMPLATE_ROW: f32 = 40.0;
+const TEMPLATE_PICTURE: (f32, f32) = (48.0, 30.0);
+const SAVE_ROW: f32 = 32.0;
+const NAME_MAX: usize = 40;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// The panel's size, and where each thing a click can hit is, in its
+/// client coordinates.
+fn panel_parts(d: &PanelData) -> (i32, i32, Vec<(Hit, Rect)>) {
+    let px = |v: f32| (v * d.scale).round() as i32;
+    let (tw, kw, th) = (px(TEMPLATES_TAB), px(KEYS_TAB.0), px(KEYS_TAB.1));
+    let (pad, row) = (px(KEYS_PAD), px(KEYS_ROW));
+    let (w, body) = match d.open {
+        None => (tw + kw, 0),
+        Some(Page::Keys) => (px(KEYS_WIDTH), pad * 2 + row * d.rows.len() as i32),
+        Some(Page::Templates) => {
+            let list = if d.templates.is_empty() { row } else { px(TEMPLATE_ROW) * d.templates.len() as i32 };
+            (px(KEYS_WIDTH), pad + row + list + px(6.0) + px(SAVE_ROW) + row + pad)
+        }
+    };
+    let h = body + th;
+    let mut hits = vec![
+        (Hit::Tab(Page::Templates), Rect::new(w - kw - tw, body, tw, th)),
+        (Hit::Tab(Page::Keys), Rect::new(w - kw, body, kw, th)),
+    ];
+    if d.open == Some(Page::Templates) {
+        let mut y = pad + row;
+        let tr = px(TEMPLATE_ROW);
+        for i in 0..d.templates.len() {
+            let r = Rect::new(pad, y, w - 2 * pad, tr);
+            let x = px(28.0);
+            hits.push((Hit::Delete(i), Rect::new(r.x + r.w - x, r.y + (tr - x) / 2, x, x)));
+            hits.push((Hit::Apply(i), r));
+            y += tr;
+        }
+        if d.templates.is_empty() {
+            y += row;
+        }
+        hits.push((Hit::Save, Rect::new(pad, y + px(6.0), w - 2 * pad, px(SAVE_ROW))));
+    }
+    (w, h, hits)
+}
+
+fn panel_hit(d: &PanelData, x: i32, y: i32) -> Option<Hit> {
+    panel_parts(d).2.into_iter().find(|(_, r)| r.contains(x, y)).map(|(hit, _)| hit)
+}
+
+/// The pointer, in `h`'s client coordinates.
+unsafe fn client_cursor(h: HWND) -> (i32, i32) {
+    let mut p = POINT::default();
+    let _ = wm::GetCursorPos(&mut p);
+    let _ = ScreenToClient(h, &mut p);
+    (p.x, p.y)
+}
+
+fn send_template_event(ev: TemplateEvent) {
+    let f = *TEMPLATE_FN.lock().unwrap();
+    if let Some(f) = f {
+        f(ev);
+    }
+}
 
 unsafe extern "system" fn keys_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let id = h.0 as isize;
+    let at = (lp.0 as i16 as i32, (lp.0 >> 16) as i16 as i32);
     match msg {
         wm::WM_ERASEBKGND => LRESULT(1),
         wm::WM_PAINT => {
             paint_keys(h);
             LRESULT(0)
         }
-        wm::WM_MOUSEACTIVATE => LRESULT(wm::MA_NOACTIVATE as isize),
+        // Clicks don't take the focus from the user's window, except to
+        // type a template's name.
+        wm::WM_MOUSEACTIVATE => {
+            let (x, y) = client_cursor(h);
+            let typing = panel_hit(&PANEL.lock().unwrap(), x, y) == Some(Hit::Save);
+            LRESULT(if typing { wm::MA_ACTIVATE } else { wm::MA_NOACTIVATE } as isize)
+        }
+        wm::WM_MOUSEMOVE => {
+            let changed = {
+                let mut d = PANEL.lock().unwrap();
+                let hover = panel_hit(&d, at.0, at.1);
+                std::mem::replace(&mut d.hover, hover) != hover
+            };
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: h,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+            if changed {
+                let _ = InvalidateRect(h, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            PANEL.lock().unwrap().hover = None;
+            let _ = InvalidateRect(h, None, false);
+            LRESULT(0)
+        }
         wm::WM_LBUTTONUP => {
-            toggle_keys(h.0 as isize);
+            let hit = panel_hit(&PANEL.lock().unwrap(), at.0, at.1);
+            match hit {
+                Some(Hit::Tab(page)) => toggle_page(id, page),
+                Some(Hit::Apply(i)) => {
+                    close_panel(id);
+                    send_template_event(TemplateEvent::Apply(i));
+                }
+                Some(Hit::Delete(i)) => send_template_event(TemplateEvent::Delete(i)),
+                Some(Hit::Save) => {
+                    let typing = PANEL.lock().unwrap().naming.is_some();
+                    if typing {
+                        commit_name(h);
+                    } else {
+                        PANEL.lock().unwrap().naming = Some(String::new());
+                        let _ = wm::SetForegroundWindow(h);
+                        let _ = SetFocus(h);
+                        let _ = InvalidateRect(h, None, false);
+                    }
+                }
+                None => {}
+            }
+            LRESULT(0)
+        }
+        wm::WM_CHAR => {
+            let c = char::from_u32(wp.0 as u32).unwrap_or('\0');
+            match c {
+                '\r' => commit_name(h),
+                '\u{1b}' => {
+                    PANEL.lock().unwrap().naming = None;
+                    let _ = InvalidateRect(h, None, false);
+                }
+                c => {
+                    if let Some(name) = PANEL.lock().unwrap().naming.as_mut() {
+                        if c == '\u{8}' {
+                            name.pop();
+                        } else if !c.is_control() && name.chars().count() < NAME_MAX {
+                            name.push(c);
+                        }
+                    }
+                    let _ = InvalidateRect(h, None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        // Clicking away stops typing a name.
+        wm::WM_ACTIVATE if (wp.0 & 0xffff) as u32 == wm::WA_INACTIVE => {
+            PANEL.lock().unwrap().naming = None;
+            let _ = InvalidateRect(h, None, false);
             LRESULT(0)
         }
         wm::WM_TIMER => {
@@ -1501,8 +1692,19 @@ unsafe extern "system" fn keys_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
     }
 }
 
-/// The shortcuts tab, showing in the corner of `area`. `rows` are (keys,
-/// what they do), a row with no keys being a heading.
+/// Save a new template under the name typed, if there is one.
+unsafe fn commit_name(h: HWND) {
+    let name = PANEL.lock().unwrap().naming.take().unwrap_or_default();
+    let _ = InvalidateRect(h, None, false);
+    let name = name.trim().to_string();
+    if !name.is_empty() {
+        send_template_event(TemplateEvent::Save(name));
+    }
+}
+
+/// The corner panel, folded into its tabs in the corner of `area`. `rows`
+/// are the shortcuts, (keys, what they do), a row with no keys being a
+/// heading.
 pub fn create_keys(rows: Vec<(String, String)>, area: Rect, scale: f32) -> Hwnd {
     let h = unsafe {
         let Ok(inst) = GetModuleHandleW(None) else { return 0 };
@@ -1515,7 +1717,8 @@ pub fn create_keys(rows: Vec<(String, String)>, area: Rect, scale: f32) -> Hwnd 
             ..Default::default()
         };
         wm::RegisterClassW(&wc);
-        let ex = wm::WS_EX_TOPMOST | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE;
+        // Not WS_EX_NOACTIVATE: it takes the focus to type a template's name.
+        let ex = wm::WS_EX_TOPMOST | wm::WS_EX_TOOLWINDOW;
         let Ok(h) =
             wm::CreateWindowExW(ex, class, w!("Lattice shortcuts"), wm::WS_POPUP, 0, 0, 0, 0, None, None, inst, None)
         else {
@@ -1532,7 +1735,7 @@ pub fn create_keys(rows: Vec<(String, String)>, area: Rect, scale: f32) -> Hwnd 
         h.0 as isize
     };
     {
-        let mut d = KEYS.lock().unwrap();
+        let mut d = PANEL.lock().unwrap();
         d.rows = rows;
         d.area = area;
         d.scale = scale;
@@ -1541,25 +1744,44 @@ pub fn create_keys(rows: Vec<(String, String)>, area: Rect, scale: f32) -> Hwnd 
     h
 }
 
-/// Open the list, or fold it back into the tab.
-pub fn toggle_keys(h: Hwnd) {
+/// Set the callback for what's done on the Templates page.
+pub fn on_template_input(f: TemplateFn) {
+    *TEMPLATE_FN.lock().unwrap() = Some(f);
+}
+
+/// The templates the panel lists.
+pub fn set_templates(h: Hwnd, templates: Vec<TemplateRow>) {
+    PANEL.lock().unwrap().templates = templates;
+    place_keys(h);
+}
+
+/// Open `page`, or fold it back into the tabs if it's already open.
+pub fn toggle_page(h: Hwnd, page: Page) {
     {
-        let mut d = KEYS.lock().unwrap();
-        d.open = !d.open;
+        let mut d = PANEL.lock().unwrap();
+        d.open = if d.open == Some(page) { None } else { Some(page) };
+        d.naming = None;
+        d.hover = None;
     }
     place_keys(h);
 }
 
-/// Put the panel in its corner, at its size for being open or not.
+/// Fold the panel back into its tabs.
+pub fn close_panel(h: Hwnd) {
+    {
+        let mut d = PANEL.lock().unwrap();
+        d.open = None;
+        d.naming = None;
+        d.hover = None;
+    }
+    place_keys(h);
+}
+
+/// Put the panel in its corner, at its size for what's open.
 fn place_keys(h: Hwnd) {
     let r = {
-        let d = KEYS.lock().unwrap();
-        let px = |v: f32| (v * d.scale).round() as i32;
-        let (w, ht) = if d.open {
-            (px(KEYS_WIDTH), px(KEYS_PAD) * 2 + px(KEYS_ROW) * d.rows.len() as i32 + px(KEYS_TAB.1))
-        } else {
-            (px(KEYS_TAB.0), px(KEYS_TAB.1))
-        };
+        let d = PANEL.lock().unwrap();
+        let (w, ht, _) = panel_parts(&d);
         crate::layout::corner_rect(d.area, w, ht)
     };
     unsafe {
@@ -1603,6 +1825,10 @@ unsafe fn keys_keep_up(h: HWND) {
     }
 }
 
+fn win_rect(r: Rect) -> RECT {
+    RECT { left: r.x, top: r.y, right: r.x + r.w, bottom: r.y + r.h }
+}
+
 unsafe fn paint_keys(h: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let dc = BeginPaint(h, &mut ps);
@@ -1613,16 +1839,15 @@ unsafe fn paint_keys(h: HWND) {
     let bmp = CreateCompatibleBitmap(dc, w, ht);
     let old = SelectObject(mem, bmp);
 
-    let (rows, open, scale) = {
-        let d = KEYS.lock().unwrap();
-        (d.rows.clone(), d.open, d.scale)
-    };
-    let px = |v: f32| (v * scale).round() as i32;
+    let d = PANEL.lock().unwrap();
+    let (_, _, hits) = panel_parts(&d);
+    let rect_of = |hit: Hit| hits.iter().find(|(x, _)| *x == hit).map(|(_, r)| win_rect(*r));
+    let px = |v: f32| (v * d.scale).round() as i32;
     // Colours as 0xBBGGRR.
-    let (bg, tab_bg, text, dim, accent) = if light_theme() {
-        (0xf3f3f3, 0xe4e4e4, 0x1a1a1a, 0x5c5c5c, 0xb85f00)
+    let (bg, tab_bg, hover_bg, text, dim, accent) = if light_theme() {
+        (0xf3f3f3, 0xe4e4e4, 0xe8e8e8, 0x1a1a1a, 0x5c5c5c, 0xb85f00)
     } else {
-        (0x2c2c2c, 0x3a3a3a, 0xffffff, 0xa8a8a8, 0xffc24c)
+        (0x2c2c2c, 0x3a3a3a, 0x383838, 0xffffff, 0xa8a8a8, 0xffc24c)
     };
     let fill = |r: RECT, c: u32| {
         let b = CreateSolidBrush(COLORREF(c));
@@ -1641,29 +1866,98 @@ unsafe fn paint_keys(h: HWND) {
         let mut s: Vec<u16> = s.encode_utf16().collect();
         DrawTextW(mem, &mut s, &mut r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | flags);
     };
+    let (pad, row) = (px(KEYS_PAD), px(KEYS_ROW));
 
-    // The tab along the bottom, which is all there is when closed.
-    let tab = RECT { left: 0, top: ht - px(KEYS_TAB.1), right: w, bottom: ht };
-    if open {
-        fill(tab, tab_bg);
+    // The tabs along the bottom, which are all there is when closed.
+    let tab_h = px(KEYS_TAB.1);
+    if d.open.is_some() {
+        fill(RECT { left: 0, top: ht - tab_h, right: w, bottom: ht }, tab_bg);
     }
-    let label = if open { "\u{2328}  Shortcuts  \u{25BE}" } else { "\u{2328}  Keys" };
-    text_at(label, tab, text, normal, DT_CENTER);
+    for (page, label) in [(Page::Templates, "\u{25A6}  Templates"), (Page::Keys, "\u{2328}  Keys")] {
+        let Some(r) = rect_of(Hit::Tab(page)) else { continue };
+        let on = d.open == Some(page);
+        if on || d.hover == Some(Hit::Tab(page)) {
+            fill(r, if on { bg } else { hover_bg });
+        }
+        text_at(label, r, if on { accent } else { text }, if on { bold } else { normal }, DT_CENTER);
+    }
 
-    if open {
-        let (pad, row) = (px(KEYS_PAD), px(KEYS_ROW));
-        for (i, (keys, what)) in rows.iter().enumerate() {
-            let y = pad + row * i as i32;
-            let line = RECT { left: pad, top: y, right: w - pad, bottom: y + row };
-            if keys.is_empty() {
-                text_at(what, line, accent, bold, DT_LEFT);
-            } else {
-                let split = pad + px(KEYS_KEY_COLUMN);
-                text_at(keys, RECT { right: split - px(8.0), ..line }, text, bold, DT_LEFT);
-                text_at(what, RECT { left: split, ..line }, dim, normal, DT_LEFT);
+    match d.open {
+        Some(Page::Keys) => {
+            for (i, (keys, what)) in d.rows.iter().enumerate() {
+                let y = pad + row * i as i32;
+                let line = RECT { left: pad, top: y, right: w - pad, bottom: y + row };
+                if keys.is_empty() {
+                    text_at(what, line, accent, bold, DT_LEFT);
+                } else {
+                    let split = pad + px(KEYS_KEY_COLUMN);
+                    text_at(keys, RECT { right: split - px(8.0), ..line }, text, bold, DT_LEFT);
+                    text_at(what, RECT { left: split, ..line }, dim, normal, DT_LEFT);
+                }
             }
         }
+        Some(Page::Templates) => {
+            text_at("Templates", RECT { left: pad, top: pad, right: w - pad, bottom: pad + row }, accent, bold, DT_LEFT);
+            if d.templates.is_empty() {
+                let r = RECT { left: pad, top: pad + row, right: w - pad, bottom: pad + 2 * row };
+                text_at("None yet. Dock your windows how you like, then save it.", r, dim, normal, DT_LEFT);
+            }
+            for (i, t) in d.templates.iter().enumerate() {
+                let Some(r) = rect_of(Hit::Apply(i)) else { continue };
+                let x = rect_of(Hit::Delete(i)).unwrap_or(r);
+                if matches!(d.hover, Some(Hit::Apply(j) | Hit::Delete(j)) if j == i) {
+                    fill(r, hover_bg);
+                }
+                // A little picture of its spots.
+                let (pw, ph) = (px(TEMPLATE_PICTURE.0), px(TEMPLATE_PICTURE.1));
+                let pic = Rect::new(r.left + px(6.0), r.top + (r.bottom - r.top - ph) / 2, pw, ph);
+                for s in &t.slots {
+                    let sr = Rect::new(
+                        pic.x + s.x * pic.w / 1000,
+                        pic.y + s.y * pic.h / 1000,
+                        (s.w * pic.w / 1000).max(1),
+                        (s.h * pic.h / 1000).max(1),
+                    );
+                    let inner = RECT { left: sr.x + 1, top: sr.y + 1, right: sr.x + sr.w - 1, bottom: sr.y + sr.h - 1 };
+                    fill(inner, mix(bg, accent, 0.55));
+                }
+                let name = RECT { left: pic.x + pic.w + px(12.0), top: r.top, right: x.left - px(4.0), bottom: r.bottom };
+                text_at(&t.name, name, text, normal, DT_LEFT);
+                let del_on = d.hover == Some(Hit::Delete(i));
+                if del_on {
+                    fill(x, tab_bg);
+                }
+                text_at("\u{2715}", x, if del_on { text } else { dim }, normal, DT_CENTER);
+            }
+            if let Some(r) = rect_of(Hit::Save) {
+                let inside = RECT { left: r.left + px(10.0), right: r.right - px(10.0), ..r };
+                match &d.naming {
+                    Some(name) => {
+                        fill(r, accent);
+                        fill(RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 }, bg);
+                        if name.is_empty() {
+                            text_at("Name this layout\u{258F}", inside, dim, normal, DT_LEFT);
+                        } else {
+                            text_at(&format!("{name}\u{258F}"), inside, text, normal, DT_LEFT);
+                        }
+                    }
+                    None => {
+                        fill(r, if d.hover == Some(Hit::Save) { hover_bg } else { tab_bg });
+                        text_at("+  Save the current layout as a template", inside, text, normal, DT_LEFT);
+                    }
+                }
+                let note = if d.naming.is_some() {
+                    "Enter to save, Esc to cancel"
+                } else {
+                    "Click one to fit the windows on the active display to it"
+                };
+                let r = RECT { left: pad, top: r.bottom, right: w - pad, bottom: r.bottom + row };
+                text_at(note, r, dim, normal, DT_LEFT);
+            }
+        }
+        None => {}
     }
+    drop(d);
 
     SelectObject(mem, old_font);
     let _ = DeleteObject(normal);
@@ -1673,4 +1967,38 @@ unsafe fn paint_keys(h: HWND) {
     let _ = DeleteObject(bmp);
     let _ = DeleteDC(mem);
     let _ = EndPaint(h, &ps);
+}
+
+// ---------------------------------------------------------------------------
+// Windows and their apps, for templates.
+
+/// Every top-level window, front to back.
+pub fn windows_front_to_back() -> Vec<Hwnd> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut h = wm::GetTopWindow(None).unwrap_or_default();
+        while !h.0.is_null() {
+            out.push(h.0 as isize);
+            h = wm::GetWindow(h, wm::GW_HWNDNEXT).unwrap_or_default();
+        }
+    }
+    out
+}
+
+/// The path of the program that owns window `h`, or "" if it can't be read.
+pub fn window_exe(h: Hwnd) -> String {
+    unsafe {
+        let mut pid = 0u32;
+        wm::GetWindowThreadProcessId(hwnd(h), Some(&mut pid));
+        let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return String::new() };
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(p);
+        if ok {
+            String::from_utf16_lossy(&buf[..len as usize])
+        } else {
+            String::new()
+        }
+    }
 }
