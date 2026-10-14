@@ -775,10 +775,13 @@ impl Layout {
                 continue;
             }
             let (reach_x, reach_y) = (edge_reach(r.w), edge_reach(r.h));
+            // The top of a window is mostly its title bar, which makes
+            // tabs, so docking above it only reaches a little past that.
+            let reach_top = self.title_zone(id, r) + reach_y / 4;
             let edges = [
                 (Edge::Left, px - r.x, reach_x),
                 (Edge::Right, r.x + r.w - 1 - px, reach_x),
-                (Edge::Top, py - r.y, reach_y),
+                (Edge::Top, py - r.y, reach_top),
                 (Edge::Bottom, r.y + r.h - 1 - py, reach_y),
             ];
             let (edge, ..) = edges
@@ -804,9 +807,25 @@ impl Layout {
             .layout_with_empty(area)
             .into_iter()
             .find(|(id, r)| *id != EMPTY && r.contains(px, py))?;
+        (id != exclude && py < r.y + self.title_zone(id, r)).then_some(id)
+    }
+
+    /// How far down window `id`, at `r`, a drop joins it as a tab: its
+    /// title bar, under its group's strip of tabs if it has one.
+    fn title_zone(&self, id: WinId, r: Rect) -> i32 {
         let bar = if self.group_of(id).is_some() { self.tab_bar } else { 0 };
-        let zone = bar + TITLE_ZONE.min(edge_reach(r.h - bar) / 2);
-        (id != exclude && py < r.y + zone).then_some(id)
+        bar + TITLE_ZONE.min(edge_reach(r.h - bar) / 2)
+    }
+
+    /// The docked window under (px, py), anywhere on it, for a drop with
+    /// Shift held: that always joins it as a tab. `exclude` is the window
+    /// being dragged.
+    pub fn window_at(&self, area: Rect, px: i32, py: i32, exclude: WinId) -> Option<WinId> {
+        self.layout_with_empty(area)
+            .into_iter()
+            .find(|(id, r)| *id != EMPTY && r.contains(px, py))
+            .map(|(id, _)| id)
+            .filter(|&id| id != exclude)
     }
 
     /// For a drop at the display's `edge` near one end of that side, the
@@ -1424,6 +1443,9 @@ mod tests {
         // Just below it still docks against its top.
         assert_eq!(l.tab_target(AREA, 700, 70, 9), None);
         assert_eq!(l.dock_target(AREA, 700, 70, 9), Some((Some(2), Edge::Top)));
+        // Not far past it, though: further down is the middle, which floats.
+        assert_eq!(l.dock_target(AREA, 700, 100, 9), None);
+        assert_eq!(l.dock_target(AREA, 700, 520, 9), Some((Some(2), Edge::Bottom)));
         // A screen edge wins.
         assert_eq!(l.tab_target(AREA, 2, 20, 9), None);
         // A group's strip and the title bar under it both count.
@@ -1434,6 +1456,20 @@ mod tests {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
         assert_eq!(l.tab_target(AREA, 700, 20, 9), None);
+    }
+
+    #[test]
+    fn shift_drop_tabs_anywhere_on_a_window() {
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        l.dock(2, Edge::Right, None);
+        assert_eq!(l.window_at(AREA, 700, 500, 9), Some(2), "middle");
+        assert_eq!(l.window_at(AREA, AREA.w - 2, 500, 9), Some(2), "by the screen's edge");
+        assert_eq!(l.window_at(AREA, 10, 10, 9), Some(1));
+        assert_eq!(l.window_at(AREA, 700, 500, 2), None, "not onto itself");
+        let mut l = Layout::new(0);
+        l.dock(1, Edge::Left, None);
+        assert_eq!(l.window_at(AREA, AREA.w - 10, 500, 9), None, "not the empty space");
     }
 
     #[test]

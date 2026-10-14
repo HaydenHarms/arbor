@@ -34,7 +34,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
-    MOD_NOREPEAT, MOD_SHIFT, VK_LBUTTON,
+    MOD_NOREPEAT, MOD_SHIFT, VK_LBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -283,6 +283,10 @@ pub fn is_maximized(h: Hwnd) -> bool {
 
 pub fn left_button_down() -> bool {
     unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0 }
+}
+
+pub fn shift_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0 }
 }
 
 /// Whether (x, y) is on the window's title bar, by asking the window.

@@ -743,13 +743,19 @@ impl App {
     }
 
     /// The docked window a window being dragged would join as a tab if
-    /// dropped now, and its display.
+    /// dropped now, and its display: its title bar, or anywhere on it with
+    /// Shift held.
     fn tab_target(&self, hwnd: Hwnd, pt: (i32, i32)) -> Option<(MonId, WinId)> {
         if !is_manageable(hwnd) {
             return None;
         }
         let mon = monitor_at(pt);
-        let onto = self.layouts.get(&mon)?.tab_target(work_area(mon), pt.0, pt.1, hwnd)?;
+        let (l, area) = (self.layouts.get(&mon)?, work_area(mon));
+        let onto = if shift_down() {
+            l.window_at(area, pt.0, pt.1, hwnd)?
+        } else {
+            l.tab_target(area, pt.0, pt.1, hwnd)?
+        };
         Some((mon, onto))
     }
 
