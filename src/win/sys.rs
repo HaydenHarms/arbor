@@ -324,8 +324,17 @@ pub fn restore_and_drag(h: Hwnd, grab: (i32, i32), pointer: (i32, i32)) {
             0,
             wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE | wm::SWP_ASYNCWINDOWPOS,
         );
-        // SC_MOVE | HTCAPTION: start the system move loop, following the
-        // button that's still held down.
+    }
+    start_move(h);
+}
+
+/// Start the system move loop on window `h`, as if grabbed by its title bar,
+/// following the left button that's still held down. Whichever of Lattice's
+/// windows has the mouse captured lets it go first.
+pub fn start_move(h: Hwnd) {
+    unsafe {
+        let _ = ReleaseCapture();
+        // SC_MOVE | HTCAPTION.
         let _ = wm::PostMessageW(hwnd(h), wm::WM_SYSCOMMAND, WPARAM((wm::SC_MOVE | wm::HTCAPTION) as usize), LPARAM(0));
     }
 }

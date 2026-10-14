@@ -204,6 +204,9 @@ struct App {
     /// A left-button press on a tab (its window, and where), which is a
     /// click or the start of dragging the tab out.
     tab_press: Option<(WinId, (i32, i32))>,
+    /// A left-button press on a strip between or beside its tabs (the
+    /// group's showing window, and where), which may start moving the group.
+    strip_press: Option<(WinId, (i32, i32))>,
     /// A tab pulled off its strip, being carried by the pointer: the
     /// window, and its rect relative to the pointer.
     tearing: Option<(WinId, Rect)>,
@@ -690,6 +693,10 @@ impl App {
                 if let Some(r) = visual_rect(old).filter(|r| r.x > -20_000) {
                     g.rect = r;
                 }
+                // A framed group stays framed, whichever tab shows.
+                if let Some((f, _)) = self.framed_float.as_mut().filter(|(f, _)| *f == old) {
+                    *f = id;
+                }
                 restore_if_maximized(id);
                 place_window(id, g.rect);
                 park_window(old);
@@ -767,8 +774,21 @@ impl App {
         let Some(wins) = wins else { return };
         let tab = strip_tab_at(strip, pt).and_then(|i| wins.get(i).copied());
         match ev {
-            StripEvent::Down => self.tab_press = tab.map(|w| (w, pt)),
+            StripEvent::Down => {
+                self.tab_press = tab.map(|w| (w, pt));
+                self.strip_press = tab.is_none().then_some((owner, pt));
+            }
             StripEvent::Drag => {
+                // Dragging the strip off the tabs moves the whole group, as
+                // if by its window's title bar.
+                if let Some((w, at)) = self.strip_press {
+                    if (pt.0 - at.0).abs() + (pt.1 - at.1).abs() > DRAG_THRESHOLD {
+                        self.strip_press = None;
+                        trace!("drag group of {w:#x} by its strip");
+                        set_foreground(w);
+                        start_move(w);
+                    }
+                }
                 if let Some((w, at)) = self.tab_press {
                     if (pt.0 - at.0).abs() + (pt.1 - at.1).abs() > DRAG_THRESHOLD {
                         self.tab_press = None;
@@ -777,6 +797,9 @@ impl App {
                 }
             }
             StripEvent::Up => {
+                if let Some((w, _)) = self.strip_press.take() {
+                    set_foreground(w);
+                }
                 if let Some((w, _)) = self.tab_press.take() {
                     self.select_tab(w);
                 }
@@ -1002,12 +1025,17 @@ impl App {
     }
 
     /// Fill display `mon` with floating window `id`, remembering that it
-    /// was at `from`.
+    /// was at `from`. A tab group is framed whole, its strip on top.
     fn frame_float(&mut self, id: WinId, mon: MonId, from: Rect) {
         self.unframe_float();
         restore_if_maximized(id);
         self.framed_float = Some((id, from));
-        self.animate(vec![(id, framed_rect(mon), true)]);
+        let mut r = framed_rect(mon);
+        if self.float_group(id).is_some() {
+            let band = band_on(mon);
+            r = Rect::new(r.x, r.y + band, r.w, (r.h - band).max(1));
+        }
+        self.animate(vec![(id, r, true)]);
     }
 
     /// Put the framed floating window back where it was. False if none was.
@@ -1157,7 +1185,6 @@ impl App {
         // stepping out puts it back where the drag began.
         if let Some(mon) = self.fullscreen_target(hwnd, pt) {
             trace!("drop fullscreen on {mon:#x}");
-            self.leave_float_group(hwnd);
             match docked_on {
                 Some(m) if m == mon => self.camera(m, |l| l.frame(hwnd)),
                 _ => {
@@ -1293,6 +1320,10 @@ impl App {
                 // Windows outside the camera are parked well off every display.
                 if visible {
                     place_window(id, r);
+                    // A floating tab group stays where its window went.
+                    if let Some(g) = self.float_groups.iter_mut().find(|g| g.tabs.shown() == id) {
+                        g.rect = r;
+                    }
                 } else {
                     park_window(id);
                 }

@@ -36,7 +36,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 
 - Click a tab to show that window. Middle-click a tab to close its window.
 - Drag a tab off the strip to take it out of the group, then drop it anywhere as usual: an edge docks it, the middle floats it, another title bar makes it a tab there.
-- Drag the showing window by its own title bar to move the whole group: to an edge to dock it there, or to the middle to float it.
+- Drag the showing window by its own title bar, or the strip anywhere off its tabs, to move the whole group: to an edge to dock it there, or to the middle to float it.
 - Tabs work with any app, because Lattice only moves windows. It never puts one app's window inside another's.
 - Switching to a hidden tab with Alt+Tab or the taskbar shows it. The same goes for any docked window zoomed out of view: Lattice steps out until it's in view.
 
