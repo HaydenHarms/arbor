@@ -355,6 +355,27 @@ impl Layout {
         true
     }
 
+    /// Take `id`'s tab group out, showing `id` first: `id` stays in the
+    /// group's spot on its own, and the other tabs leave the layout.
+    pub fn take_group(&mut self, id: WinId) -> Option<Group> {
+        self.select(id);
+        let g = self.group_of(id)?;
+        Some(self.groups.remove(g))
+    }
+
+    /// Put a group taken out by `take_group` back round its showing tab,
+    /// wherever that is docked now. False if it isn't docked on its own,
+    /// or another of the group's tabs is in the layout.
+    pub fn put_group(&mut self, group: Group) -> bool {
+        let id = group.shown();
+        if !self.contains(id) || self.group_of(id).is_some() || group.wins.iter().any(|&w| w != id && self.contains(w))
+        {
+            return false;
+        }
+        self.groups.push(group);
+        true
+    }
+
     /// Show tab `id` in its group. False if it already shows, or isn't a tab.
     pub fn select(&mut self, id: WinId) -> bool {
         let Some(g) = self.group_of(id) else { return false };
@@ -1391,6 +1412,22 @@ mod tests {
         l.restore(3, p);
         assert_eq!(l.group(2).unwrap().wins, vec![2, 3]);
         assert!(l.is_visible(3));
+    }
+
+    #[test]
+    fn a_group_moves_as_one() {
+        let mut l = tabbed();
+        l.select(2);
+        let g = l.take_group(3).unwrap();
+        assert_eq!((g.wins.clone(), g.shown()), (vec![2, 3], 3), "taking it shows the window moved");
+        assert!(!l.contains(2) && l.group(3).is_none());
+        l.remove(3);
+        l.dock(3, Edge::Left, None);
+        assert!(l.put_group(g.clone()));
+        assert_eq!(l.group(2).unwrap().wins, vec![2, 3]);
+        assert!(l.is_visible(3) && !l.is_visible(2));
+        assert_eq!(rect_of(&l, 3).x, 0, "the group is on the left now");
+        assert!(!l.put_group(g), "already back");
     }
 
     #[test]

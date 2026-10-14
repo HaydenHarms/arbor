@@ -99,6 +99,14 @@ struct FloatGroup {
     rect: Rect,
 }
 
+/// Where a window floated with Ctrl+Alt+F goes back to: its docked spot,
+/// or filling the display, framed.
+#[derive(Clone, Copy, Debug)]
+enum Spot {
+    Docked(MonId, Placement),
+    Framed(MonId),
+}
+
 /// What a dragged window would join as a tab if dropped now.
 #[derive(Clone, Copy, Debug)]
 enum TabOnto {
@@ -170,8 +178,8 @@ struct App {
     min_order: Vec<WinId>,
     /// Tab groups of floating windows.
     float_groups: Vec<FloatGroup>,
-    /// Windows floated with Ctrl+Alt+F, and where to dock them back.
-    floated: HashMap<WinId, (MonId, Placement)>,
+    /// Windows floated with Ctrl+Alt+F, and where to put them back.
+    floated: HashMap<WinId, Spot>,
     /// Visual rect of a window when a user drag began.
     drag_start: HashMap<WinId, Rect>,
     anim: Option<Anim>,
@@ -312,7 +320,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 13] = [
     (Cmd::Dock(Edge::Bottom), Mods::CtrlAltShift, VK_DOWN, "Ctrl+Alt+Shift+Down  dock bottom"),
     (Cmd::PrevTab, Mods::CtrlAlt, VK_PRIOR, "Ctrl+Alt+Page Up  previous tab"),
     (Cmd::NextTab, Mods::CtrlAlt, VK_NEXT, "Ctrl+Alt+Page Down  next tab"),
-    (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float in the middle / dock back"),
+    (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float in the middle / put back"),
     (Cmd::Minimize, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  minimize"),
     (Cmd::Unminimize, Mods::CtrlAlt, VK_C, "Ctrl+Alt+C  bring back the last minimized window"),
     (Cmd::Keys, Mods::CtrlAlt, VK_OEM_2, "Ctrl+Alt+/  show or hide these shortcuts"),
@@ -455,23 +463,36 @@ fn run_cmd(cmd: Cmd) {
                 if is_manageable(fg) {
                     app.forget_framed(fg);
                     let m = monitor_of_window(fg);
+                    // Its tabs go with it.
+                    let group = app.take_group(fg);
                     app.undock(fg);
                     app.dock(fg, m, edge, None);
+                    app.regroup(group);
                 }
             }
-            // Docked: float it in the middle of the display, remembering
-            // its spot. Floating: dock it back there, or on the right.
+            // Docked, or framed to fill the display: float it in the
+            // middle, remembering where it was. Floating: put it back
+            // there, or dock it on the right.
             Cmd::Float if is_manageable(fg) => {
+                let framed = app.framed_float.is_some_and(|(id, _)| id == fg);
                 app.forget_framed(fg);
-                if let Some(m) = app.monitor_of(fg) {
+                if framed {
+                    let m = monitor_of_window(fg);
+                    app.floated.insert(fg, Spot::Framed(m));
+                    app.animate(vec![(fg, centred(work_area(m)), true)]);
+                } else if let Some(m) = app.monitor_of(fg) {
                     if let Some(p) = app.layouts[&m].placement_of(fg) {
-                        app.floated.insert(fg, (m, p));
+                        app.floated.insert(fg, Spot::Docked(m, p));
                     }
                     app.undock(fg);
                     app.apply(m);
                     restore_if_maximized(fg);
                     app.animate(vec![(fg, centred(work_area(m)), true)]);
-                } else if let Some((m, p)) = app.floated.remove(&fg) {
+                } else if let Some(Spot::Framed(m)) = app.floated.get(&fg).copied() {
+                    app.floated.remove(&fg);
+                    let from = visual_rect(fg).unwrap_or_else(|| centred(work_area(m)));
+                    app.frame_float(fg, m, from);
+                } else if let Some(Spot::Docked(m, p)) = app.floated.remove(&fg) {
                     restore_if_maximized(fg);
                     app.layouts.entry(m).or_insert_with(|| new_layout(m)).restore(fg, p);
                     rescue_list_add(fg);
@@ -923,6 +944,43 @@ impl App {
         self.refresh_bars();
     }
 
+    /// Take `id`'s tab group apart without moving anything, docked or
+    /// floating: `id` is left on its own where it is, and `regroup` puts
+    /// the group back round it once it has moved.
+    fn take_group(&mut self, id: WinId) -> Option<Group> {
+        if let Some(i) = self.float_group(id) {
+            let mut tabs = self.float_groups.remove(i).tabs;
+            tabs.select(id);
+            return Some(tabs);
+        }
+        let m = self.monitor_of(id)?;
+        self.layouts.get_mut(&m)?.take_group(id)
+    }
+
+    /// Put a group from `take_group` back round its showing window,
+    /// docked or floating, wherever that is now.
+    fn regroup(&mut self, group: Option<Group>) {
+        let Some(group) = group else { return };
+        let id = group.shown();
+        trace!("regroup {:?} round {id:#x}", group.wins);
+        match self.monitor_of(id) {
+            Some(m) => {
+                if !self.layouts.get_mut(&m).expect("docked").put_group(group) {
+                    trace!("regroup round {id:#x} failed");
+                }
+                self.apply(m);
+            }
+            None => {
+                let Some(rect) = visual_rect(id) else { return };
+                for &w in &group.wins {
+                    rescue_list_add(w);
+                }
+                self.float_groups.push(FloatGroup { tabs: group, rect });
+                self.refresh_bars();
+            }
+        }
+    }
+
     /// Take `id` out of its floating tab group, if it's in one. If it was
     /// showing, the tab next to it shows in its place. A group down to one
     /// window is no longer a group.
@@ -1142,6 +1200,8 @@ impl App {
         trace!("drop target {drop:?}");
         match drop {
             Some((mon, target, edge)) => {
+                // Its tabs go with it.
+                let group = self.take_group(hwnd);
                 if let Some(old) = docked_on {
                     self.undock(hwnd);
                     if old != mon {
@@ -1149,12 +1209,15 @@ impl App {
                     }
                 }
                 self.dock(hwnd, mon, edge, target);
+                self.regroup(group);
             }
             // Floats where it was dropped, its tab group with it.
             _ => {
                 if let Some(m) = docked_on {
+                    let group = self.take_group(hwnd);
                     self.undock(hwnd);
                     self.apply(m);
+                    self.regroup(group);
                 }
                 self.refresh_bars();
             }
