@@ -294,12 +294,13 @@ enum Cmd {
     PrevTab,
     NextTab,
     Float,
+    Minimize,
     Keys,
     FloatAll,
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 11] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 12] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::Frame, Mods::CtrlAlt, VK_RETURN, "Ctrl+Alt+Enter  frame a window on its own"),
     (Cmd::Dock(Edge::Left), Mods::CtrlAltShift, VK_LEFT, "Ctrl+Alt+Shift+Left  dock left"),
@@ -309,6 +310,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 11] = [
     (Cmd::PrevTab, Mods::CtrlAlt, VK_PRIOR, "Ctrl+Alt+Page Up  previous tab"),
     (Cmd::NextTab, Mods::CtrlAlt, VK_NEXT, "Ctrl+Alt+Page Down  next tab"),
     (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float in the middle / dock back"),
+    (Cmd::Minimize, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  minimize"),
     (Cmd::Keys, Mods::CtrlAlt, VK_OEM_2, "Ctrl+Alt+/  show or hide these shortcuts"),
     (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
@@ -475,6 +477,8 @@ fn run_cmd(cmd: Cmd) {
                 }
             }
             Cmd::Float => {}
+            Cmd::Minimize if is_manageable(fg) => minimize(fg),
+            Cmd::Minimize => {}
             Cmd::Keys => toggle_keys(app.keys),
             Cmd::FloatAll => app.float_all(),
             Cmd::Quit => {

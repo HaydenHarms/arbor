@@ -518,6 +518,13 @@ pub fn window_under(pt: (i32, i32), skip: Hwnd) -> Hwnd {
     0
 }
 
+/// Minimize `h`, as its minimize button would.
+pub fn minimize(h: Hwnd) {
+    unsafe {
+        let _ = wm::ShowWindowAsync(hwnd(h), wm::SW_MINIMIZE);
+    }
+}
+
 pub fn is_minimized(h: Hwnd) -> bool {
     unsafe { wm::IsIconic(hwnd(h)).as_bool() }
 }
