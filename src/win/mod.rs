@@ -264,8 +264,6 @@ pub fn run() {
 #[derive(Clone, Copy, Debug)]
 enum Cmd {
     ShowAll,
-    ZoomOut,
-    ZoomIn,
     Frame,
     Dock(Edge),
     PrevTab,
@@ -277,10 +275,8 @@ enum Cmd {
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 14] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 12] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
-    (Cmd::ZoomOut, Mods::CtrlAlt, VK_UP, "Ctrl+Alt+Up  step out a level"),
-    (Cmd::ZoomIn, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  step in toward the pointer"),
     (Cmd::Frame, Mods::CtrlAlt, VK_RETURN, "Ctrl+Alt+Enter  frame a window on its own"),
     (Cmd::Dock(Edge::Left), Mods::CtrlAltShift, VK_LEFT, "Ctrl+Alt+Shift+Left  dock left"),
     (Cmd::Dock(Edge::Right), Mods::CtrlAltShift, VK_RIGHT, "Ctrl+Alt+Shift+Right  dock right"),
@@ -387,36 +383,23 @@ fn run_cmd(cmd: Cmd) {
         // Most commands act on the display the pointer is on.
         let mon = monitor_at(cursor_pos());
         trace!("cmd {cmd:?} fg {fg:#x} docked on {:?}", app.monitor_of(fg));
-        // With the overview up, showing everything (or stepping in) steps
-        // in from it; stepping out does nothing more. Anything else puts it
-        // away first.
+        // With the overview up, showing everything steps in from it.
+        // Anything else puts it away first.
         if let Some(ov) = &app.overview {
             let back = ov.return_to;
-            match cmd {
-                Cmd::ShowAll | Cmd::ZoomIn => app.close_overview(back, |l| l.zoom_all()),
-                Cmd::ZoomOut => {}
-                _ => app.end_overview(back),
-            }
-            if matches!(cmd, Cmd::ShowAll | Cmd::ZoomIn | Cmd::ZoomOut) {
+            if matches!(cmd, Cmd::ShowAll) {
+                app.close_overview(back, |l| l.zoom_all());
                 return;
             }
+            app.end_overview(back);
         }
         // Already showing everything: step out once more, to the overview.
         let at_top = app.layouts.get(&mon).is_some_and(|l| l.camera.is_empty());
-        // Every camera motion first puts a framed floating window back;
-        // stepping out does only that.
-        let framed = matches!(cmd, Cmd::ShowAll | Cmd::ZoomOut | Cmd::ZoomIn) && app.unframe_float();
+        // Showing everything first puts a framed floating window back.
+        let framed = matches!(cmd, Cmd::ShowAll) && app.unframe_float();
         match cmd {
-            Cmd::ShowAll | Cmd::ZoomOut if at_top && !framed => app.open_overview(mon),
+            Cmd::ShowAll if at_top && !framed => app.open_overview(mon),
             Cmd::ShowAll => app.camera(mon, |l| l.zoom_all()),
-            Cmd::ZoomOut if !framed => app.camera(mon, |l| l.zoom_out()),
-            Cmd::ZoomIn => {
-                let mut under = root_window_at(cursor_pos());
-                if let Some(b) = app.bars.iter().find(|b| b.strip == under) {
-                    under = b.owner;
-                }
-                app.camera(mon, |l| l.zoom_in_toward(under));
-            }
             Cmd::Frame => {
                 if let Some(m) = app.monitor_of(fg) {
                     app.unframe_float();
@@ -429,7 +412,6 @@ fn run_cmd(cmd: Cmd) {
                     }
                 }
             }
-            Cmd::ZoomOut => {}
             Cmd::PrevTab | Cmd::NextTab => {
                 let dir = if matches!(cmd, Cmd::NextTab) { 1 } else { -1 };
                 let next = app.monitor_of(fg).and_then(|m| app.layouts[&m].tab_beside(fg, dir));

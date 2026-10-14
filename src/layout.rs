@@ -341,7 +341,7 @@ impl Layout {
         if let Some(path) = self.path_of(id) {
             if !path.starts_with(&self.camera) {
                 let common = self.camera.iter().zip(&path).take_while(|(a, b)| a == b).count();
-                self.move_camera(self.camera[..common].to_vec());
+                self.camera.truncate(common);
                 changed = true;
             }
         }
@@ -606,39 +606,16 @@ impl Layout {
             .is_some_and(|n| n.contains(id))
     }
 
-    fn move_camera(&mut self, to: Vec<usize>) {
-        self.camera = to;
-    }
-
-    /// Frame the smallest node containing `id` that isn't just the leaf itself:
-    /// one step deeper toward the window.
-    pub fn zoom_in_toward(&mut self, id: WinId) {
-        let Some(path) = self.path_of(id) else { return };
-        if path.len() > self.camera.len() && path.starts_with(&self.camera) {
-            let next = path[..self.camera.len() + 1].to_vec();
-            self.move_camera(next);
-        }
-    }
-
     /// Frame a single window on its own.
     pub fn frame(&mut self, id: WinId) {
         if let Some(p) = self.path_of(id) {
-            self.move_camera(p);
-        }
-    }
-
-    /// Step out one level.
-    pub fn zoom_out(&mut self) {
-        if !self.camera.is_empty() {
-            let mut p = self.camera.clone();
-            p.pop();
-            self.move_camera(p);
+            self.camera = p;
         }
     }
 
     /// Show everything.
     pub fn zoom_all(&mut self) {
-        self.move_camera(Vec::new());
+        self.camera.clear();
     }
 
     /// The user resized `id` to `new` by dragging its border. Move the seam(s)
@@ -1200,21 +1177,8 @@ mod tests {
         let r1 = rect_of(&l, 1);
         assert!(r1.x + r1.w <= 0, "window 1 should be off-screen left: {r1:?}");
         assert!(l.is_visible(2) && !l.is_visible(1));
-        l.zoom_out();
+        l.zoom_all();
         assert_eq!(rect_of(&l, 2), Rect::new(500, 0, 500, 600));
-    }
-
-    #[test]
-    fn zoom_in_toward_steps_one_level() {
-        let mut l = Layout::new(0);
-        l.dock(1, Edge::Left, None);
-        l.dock(2, Edge::Right, None);
-        l.dock(3, Edge::Bottom, Some(2));
-        l.zoom_in_toward(3);
-        assert_eq!(l.camera, vec![1]);
-        assert_eq!(rect_of(&l, 2), Rect::new(0, 0, 1000, 300));
-        l.zoom_in_toward(3);
-        assert_eq!(rect_of(&l, 3), AREA);
     }
 
     #[test]
