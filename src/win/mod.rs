@@ -5,7 +5,8 @@ mod sys;
 
 use crate::frost;
 use crate::layout::{
-    card_parts, centred, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Layout, Placement, Rect, WinId,
+    card_parts, centred, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Group, Layout,
+    Placement, Rect, WinId, TITLE_ZONE,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -82,7 +83,27 @@ type MonId = isize;
 fn new_layout(m: MonId) -> Layout {
     let mut l = Layout::new(GAP);
     l.tab_bar = (TAB_BAR * monitor_scale(m)).round() as i32;
+    l.title = (TITLE_ZONE as f32 * monitor_scale(m)).round() as i32;
     l
+}
+
+/// The height of a strip's band for a window on display `m`.
+fn band_on(m: MonId) -> i32 {
+    (TAB_BAR * monitor_scale(m)).round() as i32
+}
+
+/// Floating windows sharing a spot as tabs: the one showing floats at
+/// `rect`, under its strip; the rest wait, parked.
+struct FloatGroup {
+    tabs: Group,
+    rect: Rect,
+}
+
+/// What a dragged window would join as a tab if dropped now.
+#[derive(Clone, Copy, Debug)]
+enum TabOnto {
+    Docked(MonId, WinId),
+    Floating(WinId),
 }
 
 /// A tab strip over a tab group: the window showing under it, and the
@@ -145,6 +166,8 @@ struct App {
     layouts: HashMap<MonId, Layout>,
     /// Windows the user minimized, and where to put them back.
     minimized: HashMap<WinId, (MonId, Placement)>,
+    /// Tab groups of floating windows.
+    float_groups: Vec<FloatGroup>,
     /// Windows floated with Ctrl+Alt+F, and where to dock them back.
     floated: HashMap<WinId, (MonId, Placement)>,
     /// Visual rect of a window when a user drag began.
@@ -414,7 +437,10 @@ fn run_cmd(cmd: Cmd) {
             }
             Cmd::PrevTab | Cmd::NextTab => {
                 let dir = if matches!(cmd, Cmd::NextTab) { 1 } else { -1 };
-                let next = app.monitor_of(fg).and_then(|m| app.layouts[&m].tab_beside(fg, dir));
+                let next = match app.monitor_of(fg) {
+                    Some(m) => app.layouts[&m].tab_beside(fg, dir),
+                    None => app.float_group(fg).map(|i| app.float_groups[i].tabs.beside(dir)),
+                };
                 if let Some(next) = next {
                     app.select_tab(next);
                 }
@@ -487,6 +513,7 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
         EVENT_SYSTEM_MINIMIZESTART => {
             app.focus_gone(hwnd);
             app.forget_framed(hwnd);
+            app.leave_float_group(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
                 if let Some(p) = app.layouts[&m].placement_of(hwnd) {
                     app.minimized.insert(hwnd, (m, p));
@@ -508,13 +535,18 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
             app.minimized.remove(&hwnd);
             app.floated.remove(&hwnd);
             app.forget_framed(hwnd);
+            app.leave_float_group(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
                 app.undock(hwnd);
                 app.apply(m);
             }
         }
         EVENT_SYSTEM_FOREGROUND => app.focus_changed(hwnd),
-        EVENT_OBJECT_NAMECHANGE if app.layouts.values().any(|l| l.group(hwnd).is_some()) => app.refresh_bars(),
+        EVENT_OBJECT_NAMECHANGE
+            if app.layouts.values().any(|l| l.group(hwnd).is_some()) || app.float_group(hwnd).is_some() =>
+        {
+            app.refresh_bars()
+        }
         _ => {}
     });
 }
@@ -586,6 +618,7 @@ impl App {
     }
 
     fn dock(&mut self, id: WinId, mon: MonId, edge: Edge, target: Option<WinId>) {
+        self.leave_float_group(id);
         self.floated.remove(&id);
         restore_if_maximized(id);
         self.layouts.entry(mon).or_insert_with(|| new_layout(mon)).dock(id, edge, target);
@@ -595,6 +628,7 @@ impl App {
 
     /// Add `id` as a tab in docked window `onto`'s spot on display `mon`.
     fn tab(&mut self, id: WinId, mon: MonId, onto: WinId) {
+        self.leave_float_group(id);
         self.floated.remove(&id);
         let Some(l) = self.layouts.get_mut(&mon) else { return };
         restore_if_maximized(id);
@@ -606,6 +640,22 @@ impl App {
 
     /// Show tab `id` in its group, at once, and give it the focus.
     fn select_tab(&mut self, id: WinId) {
+        if let Some(i) = self.float_group(id) {
+            let g = &mut self.float_groups[i];
+            let old = g.tabs.shown();
+            trace!("select floating tab {id:#x} (was {old:#x})");
+            if g.tabs.select(id) {
+                if let Some(r) = visual_rect(old).filter(|r| r.x > -20_000) {
+                    g.rect = r;
+                }
+                restore_if_maximized(id);
+                place_window(id, g.rect);
+                park_window(old);
+            }
+            set_foreground(id);
+            self.refresh_bars();
+            return;
+        }
         let Some(m) = self.monitor_of(id) else { return };
         self.finish_anim();
         let area = work_area(m);
@@ -637,14 +687,22 @@ impl App {
     /// Lattice carries it itself (see `on_mouse`): the button went down on
     /// the strip, not the window, so Windows won't drag the window.
     fn tear_tab(&mut self, id: WinId, pt: (i32, i32)) {
-        let Some(m) = self.monitor_of(id) else { return };
         self.finish_anim();
-        let Some(r) = self.layouts[&m].layout(work_area(m)).into_iter().find(|(w, _)| *w == id).map(|(_, r)| r) else {
-            return;
+        let (m, r) = if let Some(i) = self.float_group(id) {
+            let r = self.float_groups[i].rect;
+            self.leave_float_group(id);
+            (monitor_of_window(id), r)
+        } else {
+            let Some(m) = self.monitor_of(id) else { return };
+            let Some(r) = self.layouts[&m].layout(work_area(m)).into_iter().find(|(w, _)| *w == id).map(|(_, r)| r)
+            else {
+                return;
+            };
+            self.undock(id);
+            self.apply(m);
+            (m, r)
         };
         trace!("tear tab {id:#x} at {pt:?}");
-        self.undock(id);
-        self.apply(m);
         // A bit smaller than the spot it filled, hanging from the pointer
         // by its title bar.
         let (w, h) = ((r.w * 2 / 3).max(r.w.min(640)), (r.h * 2 / 3).max(r.h.min(480)));
@@ -660,8 +718,12 @@ impl App {
 
     fn strip_input(&mut self, strip: Hwnd, ev: StripEvent, pt: (i32, i32)) {
         let Some(owner) = self.bars.iter().find(|b| b.strip == strip).map(|b| b.owner) else { return };
-        let Some(m) = self.monitor_of(owner) else { return };
-        let tab = strip_tab_at(strip, pt).and_then(|i| self.layouts[&m].group(owner)?.wins.get(i).copied());
+        let wins = match self.monitor_of(owner) {
+            Some(m) => self.layouts[&m].group(owner).map(|g| g.wins.clone()),
+            None => self.float_group(owner).map(|i| self.float_groups[i].tabs.wins.clone()),
+        };
+        let Some(wins) = wins else { return };
+        let tab = strip_tab_at(strip, pt).and_then(|i| wins.get(i).copied());
         match ev {
             StripEvent::Down => self.tab_press = tab.map(|w| (w, pt)),
             StripEvent::Drag => {
@@ -693,6 +755,12 @@ impl App {
         if is_manageable(hwnd) {
             self.last_fg = hwnd;
         }
+        // A parked floating tab: show it in its group.
+        let parked_tab = self.float_group(hwnd).is_some_and(|i| self.float_groups[i].tabs.shown() != hwnd);
+        if parked_tab && !handed_on {
+            self.select_tab(hwnd);
+            return;
+        }
         if let Some(m) = self.monitor_of(hwnd).filter(|_| !handed_on) {
             if self.layouts.get_mut(&m).is_some_and(|l| l.reveal(hwnd)) {
                 trace!("revealed {hwnd:#x}");
@@ -723,6 +791,12 @@ impl App {
                 let r = rects.iter().find(|(w, _)| *w == owner).map(|(_, r)| *r);
                 wanted.push((g.wins.clone(), g.active, r, l.is_visible(owner), l.tab_bar));
             }
+        }
+        for g in &self.float_groups {
+            let owner = g.tabs.shown();
+            let shown = is_visible(owner) && !is_minimized(owner);
+            let band = band_on(monitor_of_window(owner));
+            wanted.push((g.tabs.wins.clone(), g.tabs.active, Some(g.rect), shown, band));
         }
         let mut old = std::mem::take(&mut self.bars);
         for (wins, active, r, visible, band) in wanted {
@@ -756,21 +830,96 @@ impl App {
         }
     }
 
-    /// The docked window a window being dragged would join as a tab if
-    /// dropped now, and its display: its title bar, or anywhere on it with
-    /// Shift held.
-    fn tab_target(&self, hwnd: Hwnd, pt: (i32, i32)) -> Option<(MonId, WinId)> {
+    /// The window a window being dragged would join as a tab if dropped
+    /// now: the one whose title bar or strip of tabs the pointer is on, or
+    /// with Shift held, any window under the pointer.
+    fn tab_target(&self, hwnd: Hwnd, pt: (i32, i32)) -> Option<TabOnto> {
         if !is_manageable(hwnd) {
             return None;
         }
+        let onto = |w: WinId| match self.monitor_of(w) {
+            Some(m) => TabOnto::Docked(m, w),
+            None => TabOnto::Floating(w),
+        };
+        // A strip of tabs.
+        let on_strip = self.bars.iter().find(|b| {
+            b.owner != hwnd && is_visible(b.strip) && visual_rect(b.strip).is_some_and(|r| r.contains(pt.0, pt.1))
+        });
+        if let Some(b) = on_strip {
+            return Some(onto(b.owner));
+        }
+        // A floating window on top there.
+        let under = window_under(pt, hwnd);
+        if under != 0 && self.monitor_of(under).is_none() {
+            let r = visual_rect(under)?;
+            let zone = (TITLE_ZONE as f32 * monitor_scale(monitor_at(pt))).round() as i32;
+            return (shift_down() || pt.1 < r.y + zone).then_some(TabOnto::Floating(under));
+        }
+        // A docked one.
         let mon = monitor_at(pt);
         let (l, area) = (self.layouts.get(&mon)?, work_area(mon));
-        let onto = if shift_down() {
+        let w = if shift_down() {
             l.window_at(area, pt.0, pt.1, hwnd)?
         } else {
             l.tab_target(area, pt.0, pt.1, hwnd)?
         };
-        Some((mon, onto))
+        Some(TabOnto::Docked(mon, w))
+    }
+
+    /// The floating tab group `id` is in.
+    fn float_group(&self, id: WinId) -> Option<usize> {
+        self.float_groups.iter().position(|g| g.tabs.wins.contains(&id))
+    }
+
+    /// Add `id` as a tab to floating window `onto`, starting a group there
+    /// if it isn't in one: the group keeps `onto`'s spot, its strip on top.
+    fn float_tab(&mut self, id: WinId, onto: WinId) {
+        self.floated.remove(&id);
+        self.forget_framed(id);
+        self.forget_framed(onto);
+        restore_if_maximized(id);
+        let i = match self.float_group(onto) {
+            Some(i) => i,
+            None => {
+                restore_if_maximized(onto);
+                let Some(r) = visual_rect(onto) else { return };
+                let band = band_on(monitor_of_window(onto));
+                let rect = Rect::new(r.x, r.y + band, r.w, (r.h - band).max(1));
+                self.float_groups.push(FloatGroup { tabs: Group { wins: vec![onto], active: 0 }, rect });
+                rescue_list_add(onto);
+                self.float_groups.len() - 1
+            }
+        };
+        let g = &mut self.float_groups[i];
+        let old = g.tabs.shown();
+        g.tabs.add(id);
+        let rect = g.rect;
+        trace!("floating tab {id:#x} onto {onto:#x} at {rect:?}");
+        rescue_list_add(id);
+        place_window(id, rect);
+        park_window(old);
+        set_foreground(id);
+        self.refresh_bars();
+    }
+
+    /// Take `id` out of its floating tab group, if it's in one. If it was
+    /// showing, the tab next to it shows in its place. A group down to one
+    /// window is no longer a group.
+    fn leave_float_group(&mut self, id: WinId) {
+        let Some(i) = self.float_group(id) else { return };
+        let g = &mut self.float_groups[i];
+        let was_shown = g.tabs.remove(id);
+        let (next, rect) = (g.tabs.shown(), g.rect);
+        trace!("{id:#x} leaves floating group; {next:#x} shows");
+        if g.tabs.wins.len() < 2 {
+            self.float_groups.remove(i);
+            rescue_list_remove(next);
+        }
+        rescue_list_remove(id);
+        if was_shown {
+            place_window(next, rect);
+        }
+        self.refresh_bars();
     }
 
     /// Fill display `mon` with floating window `id`, remembering that it
@@ -835,14 +984,28 @@ impl App {
         };
         self.dragging = hwnd;
         let Some(now) = visual_rect(hwnd) else { return };
+        // A floating tab group moves with its window.
+        if self.float_group(hwnd).is_some() {
+            self.follow(hwnd, now, true);
+        }
         let resizing = (now.w - start.w).abs() > 2 || (now.h - start.h).abs() > 2;
         let pt = cursor_pos();
         let zone = if resizing {
             None
         } else if let Some(mon) = self.fullscreen_target(hwnd, pt) {
             Some(framed_rect(mon))
-        } else if let Some((mon, onto)) = self.tab_target(hwnd, pt) {
-            self.layouts[&mon].slot(onto, work_area(mon))
+        } else if let Some(t) = self.tab_target(hwnd, pt) {
+            match t {
+                TabOnto::Docked(mon, onto) => self.layouts[&mon].slot(onto, work_area(mon)),
+                TabOnto::Floating(onto) => match self.float_group(onto) {
+                    Some(i) => {
+                        let r = self.float_groups[i].rect;
+                        let band = band_on(monitor_of_window(onto));
+                        Some(Rect::new(r.x, r.y - band, r.w, r.h + band))
+                    }
+                    None => visual_rect(onto),
+                },
+            }
         } else {
             self.drop_target(hwnd, pt).and_then(|(mon, target, edge)| {
                 let area = work_area(mon);
@@ -890,6 +1053,14 @@ impl App {
         let resized = (now.w - start.w).abs() > 2 || (now.h - start.h).abs() > 2;
         trace!("drag end {hwnd:#x}: {start:?} -> {now:?}, cursor {pt:?}, docked on {docked_on:?}, resized {resized}");
 
+        // A floating tab group goes wherever its window is moved or sized.
+        if let Some(i) = self.float_group(hwnd) {
+            self.float_groups[i].rect = now;
+        }
+        if resized && self.float_group(hwnd).is_some() {
+            self.refresh_bars();
+            return;
+        }
         if resized {
             // Dragged a border: move the seam so the neighbour follows.
             if let Some(m) = docked_on {
@@ -907,6 +1078,7 @@ impl App {
         // stepping out puts it back where the drag began.
         if let Some(mon) = self.fullscreen_target(hwnd, pt) {
             trace!("drop fullscreen on {mon:#x}");
+            self.leave_float_group(hwnd);
             match docked_on {
                 Some(m) if m == mon => self.camera(m, |l| l.frame(hwnd)),
                 _ => {
@@ -922,13 +1094,25 @@ impl App {
 
         // Dropped on a docked window's title bar, or a strip of tabs: join
         // that window's spot as a tab.
-        if let Some((mon, onto)) = self.tab_target(hwnd, pt) {
-            trace!("drop as tab on {onto:#x}");
-            if let Some(old) = docked_on.filter(|&m| m != mon) {
-                self.undock(hwnd);
-                self.apply(old);
+        if let Some(t) = self.tab_target(hwnd, pt) {
+            trace!("drop as tab on {t:?}");
+            self.leave_float_group(hwnd);
+            match t {
+                TabOnto::Docked(mon, onto) => {
+                    if let Some(old) = docked_on.filter(|&m| m != mon) {
+                        self.undock(hwnd);
+                        self.apply(old);
+                    }
+                    self.tab(hwnd, mon, onto);
+                }
+                TabOnto::Floating(onto) => {
+                    if let Some(m) = docked_on {
+                        self.undock(hwnd);
+                        self.apply(m);
+                    }
+                    self.float_tab(hwnd, onto);
+                }
             }
-            self.tab(hwnd, mon, onto);
             return;
         }
 
@@ -945,11 +1129,13 @@ impl App {
                 }
                 self.dock(hwnd, mon, edge, target);
             }
+            // Floats where it was dropped, its tab group with it.
             _ => {
                 if let Some(m) = docked_on {
                     self.undock(hwnd);
                     self.apply(m);
                 }
+                self.refresh_bars();
             }
         }
     }
@@ -1296,6 +1482,14 @@ impl App {
             let area = work_area(m);
             for (id, r) in l.layout(area) {
                 place_window(id, r);
+            }
+        }
+        // Every floating tab back on screen, where its group was.
+        for g in self.float_groups.drain(..) {
+            for &w in &g.tabs.wins {
+                if w != g.tabs.shown() {
+                    place_window(w, g.rect);
+                }
             }
         }
         self.layouts.clear();

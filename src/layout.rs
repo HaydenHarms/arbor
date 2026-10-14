@@ -23,8 +23,9 @@ const CORNER: f32 = 0.25;
 pub const EMPTY: WinId = 0;
 
 /// How far down a window, from its top, a drop puts it in a tab group with
-/// that window rather than docking against its top: about a title bar.
-const TITLE_ZONE: i32 = 48;
+/// that window rather than docking against its top: about a title bar, at
+/// 96 DPI.
+pub const TITLE_ZONE: i32 = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -112,6 +113,42 @@ pub struct Group {
 impl Group {
     pub fn shown(&self) -> WinId {
         self.wins[self.active]
+    }
+
+    /// Add `id` at the end, showing it.
+    pub fn add(&mut self, id: WinId) {
+        if !self.wins.contains(&id) {
+            self.wins.push(id);
+        }
+        self.active = self.wins.iter().position(|&w| w == id).expect("just added");
+    }
+
+    /// Take `id` out. True if it was the one showing: the tab next to it
+    /// shows instead (the one after it, or before it if it was last).
+    pub fn remove(&mut self, id: WinId) -> bool {
+        let Some(i) = self.wins.iter().position(|&w| w == id) else { return false };
+        let shown = i == self.active;
+        self.wins.remove(i);
+        if i < self.active || self.active == self.wins.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        shown
+    }
+
+    /// Show `id`. True if that changed which tab shows.
+    pub fn select(&mut self, id: WinId) -> bool {
+        match self.wins.iter().position(|&w| w == id) {
+            Some(i) if i != self.active => {
+                self.active = i;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The tab after the one showing (dir = 1), or before it (-1), wrapping.
+    pub fn beside(&self, dir: i32) -> WinId {
+        self.wins[(self.active as i32 + dir).rem_euclid(self.wins.len() as i32) as usize]
     }
 }
 
@@ -252,12 +289,15 @@ pub struct Layout {
     pub gap: i32,
     /// Height of a tab group's strip of tabs, in pixels.
     pub tab_bar: i32,
+    /// How far down a window a drop joins it as a tab, at most: about a
+    /// title bar, in pixels.
+    pub title: i32,
     groups: Vec<Group>,
 }
 
 impl Layout {
     pub fn new(gap: i32) -> Self {
-        Self { gap, tab_bar: 32, ..Default::default() }
+        Self { gap, tab_bar: 32, title: TITLE_ZONE, ..Default::default() }
     }
 
     pub fn contains(&self, id: WinId) -> bool {
@@ -757,7 +797,7 @@ impl Layout {
     /// title bar, under its group's strip of tabs if it has one.
     fn title_zone(&self, id: WinId, r: Rect) -> i32 {
         let bar = if self.group_of(id).is_some() { self.tab_bar } else { 0 };
-        bar + TITLE_ZONE.min(edge_reach(r.h - bar) / 2)
+        bar + self.title.min(edge_reach(r.h - bar) / 2)
     }
 
     /// The docked window under (px, py), anywhere on it, for a drop with
@@ -1251,6 +1291,24 @@ mod tests {
         l.dock(2, Edge::Right, None);
         assert!(l.tab(3, 2));
         l
+    }
+
+    #[test]
+    fn group_add_remove_select() {
+        let mut g = Group { wins: vec![1], active: 0 };
+        g.add(2);
+        g.add(3);
+        assert_eq!((g.wins.clone(), g.shown()), (vec![1, 2, 3], 3));
+        assert_eq!(g.beside(1), 1, "wraps");
+        assert_eq!(g.beside(-1), 2);
+        assert!(g.select(1) && !g.select(1));
+        assert!(!g.remove(3), "not showing");
+        assert_eq!(g.shown(), 1);
+        g.add(4);
+        assert!(g.remove(4), "showing, and last");
+        assert_eq!(g.shown(), 2, "the one before it shows");
+        assert!(g.remove(1) == false && g.shown() == 2);
+        assert!(!g.remove(9));
     }
 
     #[test]

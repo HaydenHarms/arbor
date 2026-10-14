@@ -502,6 +502,30 @@ pub fn is_manageable(h: Hwnd) -> bool {
     }
 }
 
+/// The top-most window Lattice could manage that covers `pt`, other than
+/// `skip`, or 0. Lattice's own windows (strips, the drop zone) don't count.
+pub fn window_under(pt: (i32, i32), skip: Hwnd) -> Hwnd {
+    unsafe {
+        let mut h = wm::GetTopWindow(None).unwrap_or_default();
+        while !h.0.is_null() {
+            let id = h.0 as isize;
+            if id != skip && is_manageable(id) && visual_rect(id).is_some_and(|r| r.contains(pt.0, pt.1)) {
+                return id;
+            }
+            h = wm::GetWindow(h, wm::GW_HWNDNEXT).unwrap_or_default();
+        }
+    }
+    0
+}
+
+pub fn is_minimized(h: Hwnd) -> bool {
+    unsafe { wm::IsIconic(hwnd(h)).as_bool() }
+}
+
+pub fn is_visible(h: Hwnd) -> bool {
+    unsafe { wm::IsWindowVisible(hwnd(h)).as_bool() }
+}
+
 pub fn restore_if_maximized(h: Hwnd) {
     unsafe {
         if wm::IsZoomed(hwnd(h)).as_bool() {
