@@ -166,6 +166,8 @@ struct App {
     layouts: HashMap<MonId, Layout>,
     /// Windows the user minimized, and where to put them back.
     minimized: HashMap<WinId, (MonId, Placement)>,
+    /// Minimized windows, the most recent last, for Ctrl+Alt+C.
+    min_order: Vec<WinId>,
     /// Tab groups of floating windows.
     float_groups: Vec<FloatGroup>,
     /// Windows floated with Ctrl+Alt+F, and where to dock them back.
@@ -295,12 +297,13 @@ enum Cmd {
     NextTab,
     Float,
     Minimize,
+    Unminimize,
     Keys,
     FloatAll,
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 12] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 13] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::Frame, Mods::CtrlAlt, VK_RETURN, "Ctrl+Alt+Enter  frame a window on its own"),
     (Cmd::Dock(Edge::Left), Mods::CtrlAltShift, VK_LEFT, "Ctrl+Alt+Shift+Left  dock left"),
@@ -311,6 +314,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 12] = [
     (Cmd::NextTab, Mods::CtrlAlt, VK_NEXT, "Ctrl+Alt+Page Down  next tab"),
     (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float in the middle / dock back"),
     (Cmd::Minimize, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  minimize"),
+    (Cmd::Unminimize, Mods::CtrlAlt, VK_C, "Ctrl+Alt+C  bring back the last minimized window"),
     (Cmd::Keys, Mods::CtrlAlt, VK_OEM_2, "Ctrl+Alt+/  show or hide these shortcuts"),
     (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
@@ -479,6 +483,15 @@ fn run_cmd(cmd: Cmd) {
             Cmd::Float => {}
             Cmd::Minimize if is_manageable(fg) => minimize(fg),
             Cmd::Minimize => {}
+            Cmd::Unminimize => {
+                // Skip any closed or already restored since.
+                while let Some(h) = app.min_order.pop() {
+                    if is_window(h) && is_minimized(h) {
+                        unminimize(h);
+                        break;
+                    }
+                }
+            }
             Cmd::Keys => toggle_keys(app.keys),
             Cmd::FloatAll => app.float_all(),
             Cmd::Quit => {
@@ -515,6 +528,8 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
             app.drag_ended(hwnd);
         }
         EVENT_SYSTEM_MINIMIZESTART => {
+            app.min_order.retain(|&h| h != hwnd);
+            app.min_order.push(hwnd);
             app.focus_gone(hwnd);
             app.forget_framed(hwnd);
             app.leave_float_group(hwnd);
@@ -527,6 +542,7 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
             }
         }
         EVENT_SYSTEM_MINIMIZEEND => {
+            app.min_order.retain(|&h| h != hwnd);
             if let Some((m, p)) = app.minimized.remove(&hwnd) {
                 app.layouts.entry(m).or_insert_with(|| new_layout(m)).restore(hwnd, p);
                 app.apply(m);
@@ -538,6 +554,7 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
             app.tints.remove(&hwnd);
             app.minimized.remove(&hwnd);
             app.floated.remove(&hwnd);
+            app.min_order.retain(|&h| h != hwnd);
             app.forget_framed(hwnd);
             app.leave_float_group(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {

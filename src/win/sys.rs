@@ -62,6 +62,7 @@ pub const VK_OEM_2: u32 = 0xBF; // /
 pub const VK_PRIOR: u32 = 0x21; // Page Up
 pub const VK_NEXT: u32 = 0x22; // Page Down
 pub const VK_ESCAPE: u32 = 0x1B;
+pub const VK_C: u32 = 0x43;
 pub const VK_F: u32 = 0x46;
 pub const VK_Q: u32 = 0x51;
 
@@ -522,6 +523,14 @@ pub fn window_under(pt: (i32, i32), skip: Hwnd) -> Hwnd {
 pub fn minimize(h: Hwnd) {
     unsafe {
         let _ = wm::ShowWindowAsync(hwnd(h), wm::SW_MINIMIZE);
+    }
+}
+
+/// Restore minimized `h` and give it the focus.
+pub fn unminimize(h: Hwnd) {
+    unsafe {
+        let _ = wm::ShowWindow(hwnd(h), wm::SW_RESTORE);
+        let _ = wm::SetForegroundWindow(hwnd(h));
     }
 }
 
