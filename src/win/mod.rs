@@ -145,6 +145,8 @@ struct App {
     layouts: HashMap<MonId, Layout>,
     /// Windows the user minimized, and where to put them back.
     minimized: HashMap<WinId, (MonId, Placement)>,
+    /// Windows floated with Ctrl+Alt+F, and where to dock them back.
+    floated: HashMap<WinId, (MonId, Placement)>,
     /// Visual rect of a window when a user drag began.
     drag_start: HashMap<WinId, Rect>,
     anim: Option<Anim>,
@@ -269,13 +271,12 @@ enum Cmd {
     PrevTab,
     NextTab,
     Float,
-    Centre,
     Keys,
     FloatAll,
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 12] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 11] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::Frame, Mods::CtrlAlt, VK_RETURN, "Ctrl+Alt+Enter  frame a window on its own"),
     (Cmd::Dock(Edge::Left), Mods::CtrlAltShift, VK_LEFT, "Ctrl+Alt+Shift+Left  dock left"),
@@ -284,8 +285,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 12] = [
     (Cmd::Dock(Edge::Bottom), Mods::CtrlAltShift, VK_DOWN, "Ctrl+Alt+Shift+Down  dock bottom"),
     (Cmd::PrevTab, Mods::CtrlAlt, VK_PRIOR, "Ctrl+Alt+Page Up  previous tab"),
     (Cmd::NextTab, Mods::CtrlAlt, VK_NEXT, "Ctrl+Alt+Page Down  next tab"),
-    (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float / unfloat window"),
-    (Cmd::Centre, Mods::CtrlAlt, VK_C, "Ctrl+Alt+C  float a window in the middle"),
+    (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float in the middle / dock back"),
     (Cmd::Keys, Mods::CtrlAlt, VK_OEM_2, "Ctrl+Alt+/  show or hide these shortcuts"),
     (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
@@ -427,27 +427,28 @@ fn run_cmd(cmd: Cmd) {
                     app.dock(fg, m, edge, None);
                 }
             }
-            Cmd::Float => {
+            // Docked: float it in the middle of the display, remembering
+            // its spot. Floating: dock it back there, or on the right.
+            Cmd::Float if is_manageable(fg) => {
                 app.forget_framed(fg);
-                if app.monitor_of(fg).is_some() {
+                if let Some(m) = app.monitor_of(fg) {
+                    if let Some(p) = app.layouts[&m].placement_of(fg) {
+                        app.floated.insert(fg, (m, p));
+                    }
                     app.undock(fg);
-                    app.apply_all();
-                } else if is_manageable(fg) {
-                    let m = monitor_of_window(fg);
-                    app.dock(fg, m, Edge::Right, None);
+                    app.apply(m);
+                    restore_if_maximized(fg);
+                    app.animate(vec![(fg, centred(work_area(m)), true)]);
+                } else if let Some((m, p)) = app.floated.remove(&fg) {
+                    restore_if_maximized(fg);
+                    app.layouts.entry(m).or_insert_with(|| new_layout(m)).restore(fg, p);
+                    rescue_list_add(fg);
+                    app.apply(m);
+                } else {
+                    app.dock(fg, monitor_of_window(fg), Edge::Right, None);
                 }
             }
-            Cmd::Centre if is_manageable(fg) => {
-                app.forget_framed(fg);
-                let m = app.monitor_of(fg).unwrap_or_else(|| monitor_of_window(fg));
-                if app.monitor_of(fg).is_some() {
-                    app.undock(fg);
-                    app.apply_all();
-                }
-                restore_if_maximized(fg);
-                app.animate(vec![(fg, centred(work_area(m)), true)]);
-            }
-            Cmd::Centre => {}
+            Cmd::Float => {}
             Cmd::Keys => toggle_keys(app.keys),
             Cmd::FloatAll => app.float_all(),
             Cmd::Quit => {
@@ -505,6 +506,7 @@ fn on_win_event(event: u32, hwnd: Hwnd) {
             app.icons.remove(&hwnd);
             app.tints.remove(&hwnd);
             app.minimized.remove(&hwnd);
+            app.floated.remove(&hwnd);
             app.forget_framed(hwnd);
             if let Some(m) = app.monitor_of(hwnd) {
                 app.undock(hwnd);
@@ -584,6 +586,7 @@ impl App {
     }
 
     fn dock(&mut self, id: WinId, mon: MonId, edge: Edge, target: Option<WinId>) {
+        self.floated.remove(&id);
         restore_if_maximized(id);
         self.layouts.entry(mon).or_insert_with(|| new_layout(mon)).dock(id, edge, target);
         rescue_list_add(id);
@@ -592,6 +595,7 @@ impl App {
 
     /// Add `id` as a tab in docked window `onto`'s spot on display `mon`.
     fn tab(&mut self, id: WinId, mon: MonId, onto: WinId) {
+        self.floated.remove(&id);
         let Some(l) = self.layouts.get_mut(&mon) else { return };
         restore_if_maximized(id);
         if l.tab(id, onto) {
@@ -970,13 +974,6 @@ impl App {
         }
     }
 
-    fn apply_all(&mut self) {
-        let mons: Vec<_> = self.layouts.keys().copied().collect();
-        for m in mons {
-            self.apply(m);
-        }
-    }
-
     fn animate(&mut self, targets: Vec<(WinId, Rect, bool)>) {
         // Merge with whatever is still moving so nothing jumps.
         let mut to = self.anim.take().map(|a| a.to).unwrap_or_default();
@@ -1303,6 +1300,7 @@ impl App {
         }
         self.layouts.clear();
         self.minimized.clear();
+        self.floated.clear();
         rescue_list_clear();
         self.refresh_bars();
     }

@@ -900,7 +900,7 @@ pub fn corner_rect(area: Rect, w: i32, h: i32) -> Rect {
     Rect::new(area.x + area.w - w, area.y + area.h - h, w, h)
 }
 
-/// Where Ctrl+Alt+C puts a window: floating in the middle of `area`, most
+/// Where Ctrl+Alt+F floats a docked window: floating in the middle of `area`, most
 /// of its width and height.
 pub fn centred(area: Rect) -> Rect {
     let (w, h) = ((area.w as f32 * 0.715) as i32, (area.h as f32 * 0.81) as i32);

@@ -62,7 +62,6 @@ pub const VK_OEM_2: u32 = 0xBF; // /
 pub const VK_PRIOR: u32 = 0x21; // Page Up
 pub const VK_NEXT: u32 = 0x22; // Page Down
 pub const VK_ESCAPE: u32 = 0x1B;
-pub const VK_C: u32 = 0x43;
 pub const VK_F: u32 = 0x46;
 pub const VK_Q: u32 = 0x51;
 
