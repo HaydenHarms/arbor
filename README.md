@@ -60,6 +60,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 | `Ctrl+Alt+Page Up` / `Page Down` | Previous / next tab in the active window's group |
 | `Ctrl+Alt+Shift+Arrow` | Dock the active window at that edge |
 | `Ctrl+Alt+F` | Float or dock the active window |
+| `Ctrl+Alt+C` | Float the active window in the middle of the screen |
 | `Ctrl+Alt+Shift+Q` | Quit |
 
 Each display keeps its own arrangement and camera.

@@ -775,9 +775,10 @@ impl Layout {
                 continue;
             }
             let (reach_x, reach_y) = (edge_reach(r.w), edge_reach(r.h));
-            // The top of a window is mostly its title bar, which makes
-            // tabs, so docking above it only reaches a little past that.
-            let reach_top = self.title_zone(id, r) + reach_y / 4;
+            // Docking above a window reaches a little less far than the
+            // other edges: its title bar makes tabs, and drops just below it
+            // are often meant to float.
+            let reach_top = reach_y * 4 / 5;
             let edges = [
                 (Edge::Left, px - r.x, reach_x),
                 (Edge::Right, r.x + r.w - 1 - px, reach_x),
@@ -950,6 +951,13 @@ pub fn fit(w: i32, h: i32, r: Rect) -> Rect {
 pub fn fullscreen_drop(area: Rect, px: i32, py: i32) -> bool {
     let along = (px - area.x) as f32 / area.w as f32;
     py <= area.y + 2 && (CORNER..=1.0 - CORNER).contains(&along)
+}
+
+/// Where Ctrl+Alt+C puts a window: floating in the middle of `area`, most
+/// of its width and height.
+pub fn centred(area: Rect) -> Rect {
+    let (w, h) = ((area.w as f32 * 0.715) as i32, (area.h as f32 * 0.81) as i32);
+    Rect::new(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h)
 }
 
 /// Which side of the display a drop at (px, py) docks against, if any.
@@ -1470,6 +1478,12 @@ mod tests {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
         assert_eq!(l.window_at(AREA, AREA.w - 10, 500, 9), None, "not the empty space");
+    }
+
+    #[test]
+    fn centred_geometry() {
+        assert_eq!(centred(Rect::new(0, 0, 1920, 1020)), Rect::new(274, 97, 1372, 826));
+        assert_eq!(centred(Rect::new(1920, 40, 1000, 600)), Rect::new(1920 + 142, 40 + 57, 715, 486));
     }
 
     #[test]

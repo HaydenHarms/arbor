@@ -5,7 +5,7 @@ mod sys;
 
 use crate::frost;
 use crate::layout::{
-    card_parts, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Layout, Placement, Rect, WinId,
+    card_parts, centred, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Layout, Placement, Rect, WinId,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -270,11 +270,12 @@ enum Cmd {
     PrevTab,
     NextTab,
     Float,
+    Centre,
     FloatAll,
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 16] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 17] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::ZoomOut, Mods::CtrlAlt, VK_UP, "Ctrl+Alt+Up  step out a level"),
     (Cmd::ZoomIn, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  step in toward the pointer"),
@@ -290,6 +291,7 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 16] = [
     (Cmd::PrevTab, Mods::CtrlAlt, VK_PRIOR, "Ctrl+Alt+Page Up  previous tab"),
     (Cmd::NextTab, Mods::CtrlAlt, VK_NEXT, "Ctrl+Alt+Page Down  next tab"),
     (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float / unfloat window"),
+    (Cmd::Centre, Mods::CtrlAlt, VK_C, "Ctrl+Alt+C  float a window in the middle"),
     (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
 
@@ -439,6 +441,17 @@ fn run_cmd(cmd: Cmd) {
                     app.dock(fg, m, Edge::Right, None);
                 }
             }
+            Cmd::Centre if is_manageable(fg) => {
+                app.forget_framed(fg);
+                let m = app.monitor_of(fg).unwrap_or_else(|| monitor_of_window(fg));
+                if app.monitor_of(fg).is_some() {
+                    app.undock(fg);
+                    app.apply_all();
+                }
+                restore_if_maximized(fg);
+                app.animate(vec![(fg, centred(work_area(m)), true)]);
+            }
+            Cmd::Centre => {}
             Cmd::FloatAll => app.float_all(),
             Cmd::Quit => {
                 app.float_all();
