@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, GetObjectW, GetStockObject, UpdateWindow, BITMAP, NULL_BRUSH, PS_SOLID,
     InvalidateRect, MonitorFromPoint, MonitorFromWindow, ReleaseDC, RoundRect, ScreenToClient, SelectObject, SetBkMode,
     SetStretchBltMode, SetTextColor, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    BLENDFUNCTION, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBITMAP,
+    BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBITMAP,
     HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, NULL_PEN, PAINTSTRUCT, SRCCOPY,
     TRANSPARENT,
 };
@@ -60,6 +60,7 @@ pub const VK_RIGHT: u32 = 0x27;
 pub const VK_DOWN: u32 = 0x28;
 pub const VK_OEM_4: u32 = 0xDB; // [
 pub const VK_OEM_6: u32 = 0xDD; // ]
+pub const VK_OEM_2: u32 = 0xBF; // /
 pub const VK_PRIOR: u32 = 0x21; // Page Up
 pub const VK_NEXT: u32 = 0x22; // Page Down
 pub const VK_ESCAPE: u32 = 0x1B;
@@ -1408,4 +1409,222 @@ pub fn install_rescue_hook() {
         rescue_all();
         prev(info);
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Shortcuts panel: a little tab in the corner of the screen that opens into
+// a list of Lattice's shortcuts.
+
+struct KeysData {
+    /// (keys, what they do). A row with no keys is a heading.
+    rows: Vec<(String, String)>,
+    open: bool,
+    area: Rect,
+    scale: f32,
+}
+
+static KEYS: Mutex<KeysData> =
+    Mutex::new(KeysData { rows: Vec::new(), open: false, area: Rect::new(0, 0, 0, 0), scale: 1.0 });
+
+/// Keeps the tab above other always-on-top windows, and out of the way of
+/// full-screen ones.
+const KEYS_TIMER: usize = 1;
+const KEYS_TAB: (f32, f32) = (76.0, 26.0);
+const KEYS_WIDTH: f32 = 430.0;
+const KEYS_ROW: f32 = 22.0;
+const KEYS_PAD: f32 = 12.0;
+const KEYS_KEY_COLUMN: f32 = 170.0;
+
+unsafe extern "system" fn keys_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        wm::WM_ERASEBKGND => LRESULT(1),
+        wm::WM_PAINT => {
+            paint_keys(h);
+            LRESULT(0)
+        }
+        wm::WM_MOUSEACTIVATE => LRESULT(wm::MA_NOACTIVATE as isize),
+        wm::WM_LBUTTONUP => {
+            toggle_keys(h.0 as isize);
+            LRESULT(0)
+        }
+        wm::WM_TIMER => {
+            keys_keep_up(h);
+            LRESULT(0)
+        }
+        _ => wm::DefWindowProcW(h, msg, wp, lp),
+    }
+}
+
+/// The shortcuts tab, showing in the corner of `area`. `rows` are (keys,
+/// what they do), a row with no keys being a heading.
+pub fn create_keys(rows: Vec<(String, String)>, area: Rect, scale: f32) -> Hwnd {
+    let h = unsafe {
+        let Ok(inst) = GetModuleHandleW(None) else { return 0 };
+        let class = w!("LatticeKeys");
+        let wc = wm::WNDCLASSW {
+            lpfnWndProc: Some(keys_proc),
+            hInstance: inst.into(),
+            lpszClassName: class,
+            hCursor: wm::LoadCursorW(None, wm::IDC_HAND).unwrap_or_default(),
+            ..Default::default()
+        };
+        wm::RegisterClassW(&wc);
+        let ex = wm::WS_EX_TOPMOST | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE;
+        let Ok(h) =
+            wm::CreateWindowExW(ex, class, w!("Lattice shortcuts"), wm::WS_POPUP, 0, 0, 0, 0, None, None, inst, None)
+        else {
+            return 0;
+        };
+        let round = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            h,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &round as *const _ as *const c_void,
+            std::mem::size_of_val(&round) as u32,
+        );
+        let _ = wm::SetTimer(h, KEYS_TIMER, 1000, None);
+        h.0 as isize
+    };
+    {
+        let mut d = KEYS.lock().unwrap();
+        d.rows = rows;
+        d.area = area;
+        d.scale = scale;
+    }
+    place_keys(h);
+    h
+}
+
+/// Open the list, or fold it back into the tab.
+pub fn toggle_keys(h: Hwnd) {
+    {
+        let mut d = KEYS.lock().unwrap();
+        d.open = !d.open;
+    }
+    place_keys(h);
+}
+
+/// Put the panel in its corner, at its size for being open or not.
+fn place_keys(h: Hwnd) {
+    let r = {
+        let d = KEYS.lock().unwrap();
+        let px = |v: f32| (v * d.scale).round() as i32;
+        let (w, ht) = if d.open {
+            (px(KEYS_WIDTH), px(KEYS_PAD) * 2 + px(KEYS_ROW) * d.rows.len() as i32 + px(KEYS_TAB.1))
+        } else {
+            (px(KEYS_TAB.0), px(KEYS_TAB.1))
+        };
+        crate::layout::corner_rect(d.area, w, ht)
+    };
+    unsafe {
+        let _ = wm::SetWindowPos(
+            hwnd(h),
+            wm::HWND_TOPMOST,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            wm::SWP_SHOWWINDOW | wm::SWP_NOACTIVATE,
+        );
+        let _ = InvalidateRect(hwnd(h), None, false);
+    }
+}
+
+/// Back on top of other always-on-top windows, unless something is
+/// full screen, when it hides.
+unsafe fn keys_keep_up(h: HWND) {
+    let fg = wm::GetForegroundWindow();
+    let full = !fg.0.is_null() && fg != h && {
+        let mut class = [0u16; 32];
+        let n = wm::GetClassNameW(fg, &mut class);
+        let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
+        let mut r = RECT::default();
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        class != "Progman"
+            && class != "WorkerW"
+            && wm::GetWindowRect(fg, &mut r).is_ok()
+            && GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
+            && r.left <= info.rcMonitor.left
+            && r.top <= info.rcMonitor.top
+            && r.right >= info.rcMonitor.right
+            && r.bottom >= info.rcMonitor.bottom
+    };
+    if full {
+        let _ = wm::ShowWindow(h, wm::SW_HIDE);
+    } else {
+        let flags = wm::SWP_NOMOVE | wm::SWP_NOSIZE | wm::SWP_NOACTIVATE | wm::SWP_SHOWWINDOW;
+        let _ = wm::SetWindowPos(h, wm::HWND_TOPMOST, 0, 0, 0, 0, flags);
+    }
+}
+
+unsafe fn paint_keys(h: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let dc = BeginPaint(h, &mut ps);
+    let mut rc = RECT::default();
+    let _ = wm::GetClientRect(h, &mut rc);
+    let (w, ht) = (rc.right.max(1), rc.bottom.max(1));
+    let mem = CreateCompatibleDC(dc);
+    let bmp = CreateCompatibleBitmap(dc, w, ht);
+    let old = SelectObject(mem, bmp);
+
+    let (rows, open, scale) = {
+        let d = KEYS.lock().unwrap();
+        (d.rows.clone(), d.open, d.scale)
+    };
+    let px = |v: f32| (v * scale).round() as i32;
+    // Colours as 0xBBGGRR.
+    let (bg, tab_bg, text, dim, accent) = if light_theme() {
+        (0xf3f3f3, 0xe4e4e4, 0x1a1a1a, 0x5c5c5c, 0xb85f00)
+    } else {
+        (0x2c2c2c, 0x3a3a3a, 0xffffff, 0xa8a8a8, 0xffc24c)
+    };
+    let fill = |r: RECT, c: u32| {
+        let b = CreateSolidBrush(COLORREF(c));
+        FillRect(mem, &r, b);
+        let _ = DeleteObject(b);
+    };
+    fill(rc, bg);
+    let font = |size: f32, weight: i32| CreateFontW(-px(size), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI"));
+    let (normal, bold) = (font(12.0, 400), font(12.0, 600));
+    let old_font = SelectObject(mem, normal);
+    let _ = SetBkMode(mem, TRANSPARENT);
+    let text_at = |s: &str, r: RECT, colour: u32, f, flags| {
+        SelectObject(mem, f);
+        let _ = SetTextColor(mem, COLORREF(colour));
+        let mut r = r;
+        let mut s: Vec<u16> = s.encode_utf16().collect();
+        DrawTextW(mem, &mut s, &mut r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | flags);
+    };
+
+    // The tab along the bottom, which is all there is when closed.
+    let tab = RECT { left: 0, top: ht - px(KEYS_TAB.1), right: w, bottom: ht };
+    if open {
+        fill(tab, tab_bg);
+    }
+    let label = if open { "\u{2328}  Shortcuts  \u{25BE}" } else { "\u{2328}  Keys" };
+    text_at(label, tab, text, normal, DT_CENTER);
+
+    if open {
+        let (pad, row) = (px(KEYS_PAD), px(KEYS_ROW));
+        for (i, (keys, what)) in rows.iter().enumerate() {
+            let y = pad + row * i as i32;
+            let line = RECT { left: pad, top: y, right: w - pad, bottom: y + row };
+            if keys.is_empty() {
+                text_at(what, line, accent, bold, DT_LEFT);
+            } else {
+                let split = pad + px(KEYS_KEY_COLUMN);
+                text_at(keys, RECT { right: split - px(8.0), ..line }, text, bold, DT_LEFT);
+                text_at(what, RECT { left: split, ..line }, dim, normal, DT_LEFT);
+            }
+        }
+    }
+
+    SelectObject(mem, old_font);
+    let _ = DeleteObject(normal);
+    let _ = DeleteObject(bold);
+    let _ = BitBlt(dc, 0, 0, w, ht, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    let _ = DeleteObject(bmp);
+    let _ = DeleteDC(mem);
+    let _ = EndPaint(h, &ps);
 }

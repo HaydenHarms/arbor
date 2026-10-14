@@ -180,6 +180,8 @@ struct App {
     focus_lost: Option<Instant>,
     /// The overview's window, and the overview while it's up.
     overview_host: Hwnd,
+    /// The shortcuts tab in the corner of the main display.
+    keys: Hwnd,
     overview: Option<Overview>,
     /// Apps' colours, from their icons, for their cards in the overview.
     tints: HashMap<WinId, Option<u32>>,
@@ -236,9 +238,12 @@ pub fn run() {
     on_strip_input(on_strip);
     on_overview_input(|ev, pt| with_app(|app| app.overview_input(ev, pt)));
     let overlay = create_overlay();
+    let main = monitor_at((0, 0));
+    let keys = create_keys(shortcut_rows(), work_area(main), monitor_scale(main));
     with_app(|app| {
         app.hwnd = hwnd;
         app.overlay = overlay;
+        app.keys = keys;
     });
     if !failed.is_empty() {
         message_box(
@@ -271,11 +276,12 @@ enum Cmd {
     NextTab,
     Float,
     Centre,
+    Keys,
     FloatAll,
     Quit,
 }
 
-const HOTKEYS: [(Cmd, Mods, u32, &str); 17] = [
+const HOTKEYS: [(Cmd, Mods, u32, &str); 18] = [
     (Cmd::ShowAll, Mods::CtrlAlt, VK_SPACE, "Ctrl+Alt+Space  show everything"),
     (Cmd::ZoomOut, Mods::CtrlAlt, VK_UP, "Ctrl+Alt+Up  step out a level"),
     (Cmd::ZoomIn, Mods::CtrlAlt, VK_DOWN, "Ctrl+Alt+Down  step in toward the pointer"),
@@ -292,8 +298,31 @@ const HOTKEYS: [(Cmd, Mods, u32, &str); 17] = [
     (Cmd::NextTab, Mods::CtrlAlt, VK_NEXT, "Ctrl+Alt+Page Down  next tab"),
     (Cmd::Float, Mods::CtrlAlt, VK_F, "Ctrl+Alt+F  float / unfloat window"),
     (Cmd::Centre, Mods::CtrlAlt, VK_C, "Ctrl+Alt+C  float a window in the middle"),
+    (Cmd::Keys, Mods::CtrlAlt, VK_OEM_2, "Ctrl+Alt+/  show or hide these shortcuts"),
     (Cmd::Quit, Mods::CtrlAltShift, VK_Q, "Ctrl+Alt+Shift+Q  quit Lattice"),
 ];
+
+/// What the shortcuts tab lists: the hotkeys, then what the mouse does.
+fn shortcut_rows() -> Vec<(String, String)> {
+    let row = |k: &str, w: &str| (k.to_string(), w.to_string());
+    let mut rows = vec![row("", "Keyboard")];
+    for (.., label) in HOTKEYS {
+        let (keys, what) = label.split_once("  ").unwrap_or((label, ""));
+        let mut what = what.chars();
+        let what = what.next().map_or(String::new(), |c| c.to_uppercase().chain(what).collect());
+        rows.push((keys.to_string(), what));
+    }
+    rows.extend([
+        row("", "Mouse"),
+        row("Drag to a screen edge", "Dock there"),
+        row("Drag to a window's edge", "Dock beside it"),
+        row("Drop on a title bar", "Join it as a tab"),
+        row("Shift + drop on a window", "Join it as a tab"),
+        row("Drag a tab off its strip", "Take it out of the group"),
+        row("Middle-click a tab", "Close that window"),
+    ]);
+    rows
+}
 
 const MENU_SHOW_ALL: usize = 100;
 const MENU_OVERVIEW: usize = 103;
@@ -452,6 +481,7 @@ fn run_cmd(cmd: Cmd) {
                 app.animate(vec![(fg, centred(work_area(m)), true)]);
             }
             Cmd::Centre => {}
+            Cmd::Keys => toggle_keys(app.keys),
             Cmd::FloatAll => app.float_all(),
             Cmd::Quit => {
                 app.float_all();

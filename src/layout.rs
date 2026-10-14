@@ -953,6 +953,11 @@ pub fn fullscreen_drop(area: Rect, px: i32, py: i32) -> bool {
     py <= area.y + 2 && (CORNER..=1.0 - CORNER).contains(&along)
 }
 
+/// A `w` by `h` rect tucked into the bottom-right corner of `area`.
+pub fn corner_rect(area: Rect, w: i32, h: i32) -> Rect {
+    Rect::new(area.x + area.w - w, area.y + area.h - h, w, h)
+}
+
 /// Where Ctrl+Alt+C puts a window: floating in the middle of `area`, most
 /// of its width and height.
 pub fn centred(area: Rect) -> Rect {
@@ -1478,6 +1483,12 @@ mod tests {
         let mut l = Layout::new(0);
         l.dock(1, Edge::Left, None);
         assert_eq!(l.window_at(AREA, AREA.w - 10, 500, 9), None, "not the empty space");
+    }
+
+    #[test]
+    fn corner_geometry() {
+        assert_eq!(corner_rect(Rect::new(0, 0, 1920, 1020), 95, 33), Rect::new(1825, 987, 95, 33));
+        assert_eq!(corner_rect(Rect::new(-1000, 40, 1000, 600), 10, 20), Rect::new(-10, 620, 10, 20));
     }
 
     #[test]
