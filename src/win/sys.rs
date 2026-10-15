@@ -1477,6 +1477,8 @@ pub enum Page {
 pub struct TemplateRow {
     pub name: String,
     pub slots: Vec<Rect>,
+    /// A window floating in the middle, over the spots.
+    pub centre: Option<Rect>,
 }
 
 /// What the user did on the Templates page.
@@ -1920,6 +1922,12 @@ unsafe fn paint_keys(h: HWND) {
                     );
                     let inner = RECT { left: sr.x + 1, top: sr.y + 1, right: sr.x + sr.w - 1, bottom: sr.y + sr.h - 1 };
                     fill(inner, mix(bg, accent, 0.55));
+                }
+                if let Some(c) = t.centre {
+                    let (x, y) = (pic.x + c.x * pic.w / 1000, pic.y + c.y * pic.h / 1000);
+                    let (cw, ch) = (c.w * pic.w / 1000, c.h * pic.h / 1000);
+                    fill(RECT { left: x, top: y, right: x + cw, bottom: y + ch }, bg);
+                    fill(RECT { left: x + 1, top: y + 1, right: x + cw - 1, bottom: y + ch - 1 }, mix(bg, accent, 0.9));
                 }
                 let name = RECT { left: pic.x + pic.w + px(12.0), top: r.top, right: x.left - px(4.0), bottom: r.bottom };
                 text_at(&t.name, name, text, normal, DT_LEFT);

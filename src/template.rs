@@ -6,6 +6,9 @@
 //! one fits whatever is open now, loosely. Spots go to windows of the app
 //! that was there first, then the rest in order. Spots left over close up;
 //! windows left over join the last spot as tabs.
+//!
+//! It can also keep the app of a window floating in the middle of the
+//! display (where Ctrl+Alt+F puts one), to put a window of it back there.
 
 use crate::layout::{split_rects, Axis, Rect, WinId};
 
@@ -20,6 +23,8 @@ pub enum Shape {
 pub struct Template {
     pub name: String,
     pub shape: Shape,
+    /// The app floating in the middle, if one was.
+    pub centre: Option<String>,
 }
 
 impl Shape {
@@ -109,16 +114,25 @@ fn parse_shape(s: &str) -> Option<(Shape, &str)> {
 }
 
 impl Template {
-    /// One line of the templates file: the name, a tab, the shape.
+    /// One line of the templates file: the name, a tab, the shape, and
+    /// another tab and the app in the middle if there is one.
     pub fn to_line(&self) -> String {
-        format!("{}\t{}", clean_name(&self.name), self.shape.to_text())
+        let mut line = format!("{}\t{}", clean_name(&self.name), self.shape.to_text());
+        if let Some(app) = &self.centre {
+            line = format!("{line}\t{app}");
+        }
+        line
     }
 
     pub fn parse_line(line: &str) -> Option<Template> {
-        let (name, shape) = line.split_once('\t')?;
+        let (name, rest) = line.split_once('\t')?;
         let name = clean_name(name);
         (!name.is_empty()).then_some(())?;
-        Some(Template { name, shape: Shape::parse(shape)? })
+        let (shape, centre) = match rest.split_once('\t') {
+            Some((shape, app)) => (shape, Some(app_key(app)).filter(|a| !a.is_empty())),
+            None => (rest, None),
+        };
+        Some(Template { name, shape: Shape::parse(shape)?, centre })
     }
 }
 
@@ -191,11 +205,21 @@ mod tests {
         let s = sample();
         assert_eq!(s.to_text(), "h(1.5:[code],1:v(2:[chrome],1:[]))");
         assert_eq!(Shape::parse(&s.to_text()), Some(s.clone()));
-        let t = Template { name: "Work\tday\n".into(), shape: s };
+        let t = Template { name: "Work\tday\n".into(), shape: s, centre: None };
         let back = parse_file(&to_file(&[t]));
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].name, "Workday");
         assert_eq!(back[0].shape, sample());
+        assert_eq!(back[0].centre, None);
+    }
+
+    #[test]
+    fn the_app_in_the_middle_round_trips() {
+        let t = Template { name: "Focus".into(), shape: sample(), centre: Some("windowsterminal".into()) };
+        assert_eq!(t.to_line(), "Focus\th(1.5:[code],1:v(2:[chrome],1:[]))\twindowsterminal");
+        assert_eq!(parse_file(&to_file(&[t.clone()])), vec![t]);
+        // An empty one reads as none.
+        assert_eq!(Template::parse_line("A\t[]\t").unwrap().centre, None);
     }
 
     #[test]

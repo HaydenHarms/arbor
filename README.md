@@ -48,6 +48,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
   - Too few windows? Docked ones go first, then floating ones on that display. Spots nobody fills close up, and the windows beside them take the space.
   - Too many? Docked windows left over become tabs in the last spot, so nothing goes missing. Floating windows are only pulled in to fill spots.
   - Tab groups move as one.
+- A window floating in the middle of the screen (where `Ctrl+Alt+F` puts one) is saved with the template too. Applying it puts a window of that app back in the middle, in front, and leaves it out of the docked spots.
 - Click the ✕ beside a template to delete it. Saving under a name that's already taken replaces that template.
 - Templates are kept in `%LOCALAPPDATA%\Lattice\templates.txt`, so they survive restarts.
 

@@ -6,7 +6,7 @@ mod sys;
 use crate::frost;
 use crate::template::{self, Template};
 use crate::layout::{
-    card_parts, centred, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Group, Layout,
+    card_parts, centred, is_centred, ease, fit, fullscreen_drop, overview_area, tab_bar_over, tab_rects, Edge, Group, Layout,
     Placement, Rect, WinId, TITLE_ZONE,
 };
 use std::cell::RefCell;
@@ -1649,8 +1649,9 @@ impl App {
             return;
         };
         let name = template::clean_name(name);
-        trace!("save template {name:?}: {}", shape.to_text());
-        let t = Template { name, shape };
+        let centre = self.centred_window(mon).map(|w| template::app_key(&window_exe(w)));
+        trace!("save template {name:?}: {}, {centre:?} in the middle", shape.to_text());
+        let t = Template { name, shape, centre };
         match self.templates.iter().position(|o| o.name.eq_ignore_ascii_case(&t.name)) {
             Some(i) => self.templates[i] = t,
             None => self.templates.push(t),
@@ -1676,7 +1677,11 @@ impl App {
         let rows = self
             .templates
             .iter()
-            .map(|t| TemplateRow { name: t.name.clone(), slots: t.shape.rects(square) })
+            .map(|t| TemplateRow {
+                name: t.name.clone(),
+                slots: t.shape.rects(square),
+                centre: t.centre.as_ref().map(|_| centred(square)),
+            })
             .collect();
         set_templates(self.keys, rows);
     }
@@ -1694,6 +1699,12 @@ impl App {
         self.finish_anim();
         let mon = self.template_display();
         let hints = t.shape.hints();
+        // A window of the app that was in the middle goes back there, and
+        // stays out of the spots.
+        let centre = t.centre.as_ref().and_then(|app| self.window_of_app(mon, app));
+        if let Some(c) = centre.filter(|&c| self.monitor_of(c).is_some()) {
+            self.undock(c);
+        }
         let docked = self.layouts.get(&mon).map(|l| l.leaves()).unwrap_or_default();
         let mut wins: Vec<(WinId, String)> =
             docked.iter().map(|&w| (w, template::app_key(&window_exe(w)))).collect();
@@ -1701,7 +1712,8 @@ impl App {
             if wins.len() >= hints.len() {
                 break;
             }
-            let showing = is_manageable(w)
+            let showing = Some(w) != centre
+                && is_manageable(w)
                 && !is_minimized(w)
                 && self.monitor_of(w).is_none()
                 && monitor_of_window(w) == mon
@@ -1734,6 +1746,53 @@ impl App {
             l.put_group(g);
         }
         self.apply(mon);
+        if let Some(c) = centre {
+            self.float_centred(c, mon);
+        }
+    }
+
+    /// A floating window showing in the middle of display `mon`, where
+    /// Ctrl+Alt+F puts one: the frontmost, if there are several.
+    fn centred_window(&self, mon: MonId) -> Option<WinId> {
+        let area = work_area(mon);
+        let slack = (12.0 * monitor_scale(mon)) as i32;
+        windows_front_to_back().into_iter().find(|&w| {
+            is_manageable(w)
+                && !is_minimized(w)
+                && self.monitor_of(w).is_none()
+                && monitor_of_window(w) == mon
+                && visual_rect(w).is_some_and(|r| is_centred(r, area, slack))
+        })
+    }
+
+    /// A window of `app` on display `mon` to put in the middle: a floating
+    /// one in view first, front to back, then a docked one.
+    fn window_of_app(&self, mon: MonId, app: &str) -> Option<WinId> {
+        let of_app = |w: WinId| template::app_key(&window_exe(w)) == app;
+        let floating = windows_front_to_back().into_iter().find(|&w| {
+            is_manageable(w)
+                && !is_minimized(w)
+                && self.monitor_of(w).is_none()
+                && monitor_of_window(w) == mon
+                && visual_rect(w).is_some_and(|r| r.x > -20_000)
+                && self.float_group(w).is_none_or(|g| self.float_groups[g].tabs.shown() == w)
+                && of_app(w)
+        });
+        floating.or_else(|| self.layouts.get(&mon)?.leaves().into_iter().find(|&w| of_app(w)))
+    }
+
+    /// Float `id` in the middle of display `mon`, in front, its floating
+    /// tabs with it.
+    fn float_centred(&mut self, id: WinId, mon: MonId) {
+        self.forget_framed(id);
+        restore_if_maximized(id);
+        let to = centred(work_area(mon));
+        if let Some(g) = self.float_group(id) {
+            self.float_groups[g].rect = to;
+        }
+        self.animate(vec![(id, to, true)]);
+        set_foreground(id);
+        self.refresh_bars();
     }
 
     /// Release every window: back to a normal desktop, nothing lost.

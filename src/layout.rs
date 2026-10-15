@@ -1063,6 +1063,16 @@ pub fn centred(area: Rect) -> Rect {
     Rect::new(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h)
 }
 
+/// Whether `r` is where `centred` puts a window in `area`, give or take
+/// `slack` on each side.
+pub fn is_centred(r: Rect, area: Rect, slack: i32) -> bool {
+    let c = centred(area);
+    (r.x - c.x).abs() <= slack
+        && (r.y - c.y).abs() <= slack
+        && (r.x + r.w - c.x - c.w).abs() <= slack
+        && (r.y + r.h - c.y - c.h).abs() <= slack
+}
+
 /// Which side of the display a drop at (px, py) docks against, if any.
 ///
 /// Only the pointer counts, not how far the window hangs off: wide windows
@@ -1591,6 +1601,16 @@ mod tests {
     fn corner_geometry() {
         assert_eq!(corner_rect(Rect::new(0, 0, 1920, 1020), 95, 33), Rect::new(1825, 987, 95, 33));
         assert_eq!(corner_rect(Rect::new(-1000, 40, 1000, 600), 10, 20), Rect::new(-10, 620, 10, 20));
+    }
+
+    #[test]
+    fn is_centred_allows_some_slack() {
+        let area = Rect::new(0, 0, 1000, 800);
+        let c = centred(area);
+        assert!(is_centred(c, area, 0));
+        assert!(is_centred(Rect::new(c.x + 5, c.y - 5, c.w, c.h), area, 8));
+        assert!(!is_centred(Rect::new(c.x + 20, c.y, c.w, c.h), area, 8));
+        assert!(!is_centred(Rect::new(c.x, c.y, c.w - 30, c.h), area, 8));
     }
 
     #[test]
