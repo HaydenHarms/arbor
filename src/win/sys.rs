@@ -563,28 +563,20 @@ pub fn restore_if_maximized(h: Hwnd) {
     }
 }
 
-/// The whole display, taskbar and all.
-pub fn monitor_rect(m: isize) -> Rect {
-    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-    unsafe {
-        let _ = GetMonitorInfoW(mon(m), &mut mi);
-    }
-    to_rect(mi.rcMonitor)
-}
-
 // ---------------------------------------------------------------------------
 // Full screen: one window at a time can have its frame taken off and cover
-// its whole display, over the taskbar. Its old style is kept here, so it
+// its display, all but the taskbar. Its old style is kept here, so it
 // gets its frame back even if Lattice crashes.
 
 static FULL: Mutex<Option<(Hwnd, i32)>> = Mutex::new(None);
 
-/// Take `h`'s frame off and cover display `m` with it, in front. Another
+/// Take `h`'s frame off and cover display `m` with it, all but the
+/// taskbar, in front. Another
 /// window full screen gets its frame back first.
 pub fn enter_fullscreen(h: Hwnd, m: isize) {
     end_fullscreen();
     restore_if_maximized(h);
-    let r = monitor_rect(m);
+    let r = work_area(m);
     unsafe {
         let w = hwnd(h);
         let style = wm::GetWindowLongW(w, wm::GWL_STYLE);

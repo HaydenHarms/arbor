@@ -1123,8 +1123,8 @@ impl App {
         self.full.is_some_and(|(f, _)| f == id)
     }
 
-    /// Take `id`'s frame off and cover its whole display with it, taskbar
-    /// and all. Docked, it keeps its spot to go back to; floating, where
+    /// Take `id`'s frame off and cover its display with it, all but
+    /// the taskbar. Docked, it keeps its spot to go back to; floating, where
     /// it was (before it was framed, if it was).
     fn go_full(&mut self, id: WinId) {
         let back = self.framed_float.filter(|(f, _)| *f == id).map(|(_, r)| r).or_else(|| visual_rect(id));

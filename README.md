@@ -65,7 +65,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Alt+Space` | Show everything (again for the overview) |
-| `Ctrl+Alt+Enter` | Full screen the active window, docked or floating: its frame comes off and it covers the whole display, taskbar too. Again to put it back |
+| `Ctrl+Alt+Enter` | Full screen the active window, docked or floating: its frame comes off and it fills the whole display above the taskbar. Again to put it back |
 | `Ctrl+Alt+Page Up` / `Page Down` | Previous / next tab in the active window's group |
 | `Ctrl+Alt+Shift+Arrow` | Dock the active window at that edge, with its tabs |
 | `Ctrl+Alt+F` | Float the active window in the middle of the screen, or put it back where it was: docked, or filling the screen |
