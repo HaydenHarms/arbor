@@ -27,6 +27,10 @@ const DRAG_TIMER: usize = 2;
 
 /// Moves the overview's pictures.
 const OVERVIEW_TIMER: usize = 3;
+/// Stacks the tab strips again shortly after a window comes to the front.
+/// Windows reports the new foreground window before it has always risen,
+/// so a strip stacked right away can land under whatever covered it.
+const RESTACK_TIMER: usize = 4;
 /// Stepping out to the overview and back in, a touch slower than other
 /// motion as everything on the display moves at once.
 const OVERVIEW_MOTION: Duration = Duration::from_millis(300);
@@ -400,6 +404,13 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
         }
         WM_TIMER if wparam == OVERVIEW_TIMER => {
             with_app(|app| app.overview_tick());
+            Some(0)
+        }
+        WM_TIMER if wparam == RESTACK_TIMER => {
+            with_app(|app| {
+                kill_timer(app.hwnd, RESTACK_TIMER);
+                app.refresh_bars();
+            });
             Some(0)
         }
         WM_MOUSE_HOOK => {
@@ -885,6 +896,7 @@ impl App {
         if is_manageable(hwnd) {
             self.last_fg = hwnd;
         }
+        set_timer(self.hwnd, RESTACK_TIMER, 100);
         // A parked floating tab: show it in its group.
         let parked_tab = self.float_group(hwnd).is_some_and(|i| self.float_groups[i].tabs.shown() != hwnd);
         if parked_tab && !handed_on {
