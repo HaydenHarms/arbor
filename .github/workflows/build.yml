@@ -3,10 +3,14 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,3 +23,8 @@ jobs:
         with:
           name: lattice-windows-x64
           path: target/release/lattice.exe
+      # A published release gets the exe built from its tag.
+      - if: github.event_name == 'release'
+        run: gh release upload ${{ github.event.release.tag_name }} target/release/lattice.exe --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
