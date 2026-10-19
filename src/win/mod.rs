@@ -1135,9 +1135,9 @@ impl App {
         self.full.is_some_and(|(f, _)| f == id)
     }
 
-    /// Take `id`'s frame off and cover its display with it, all but
-    /// the taskbar. Docked, it keeps its spot to go back to; floating, where
-    /// it was (before it was framed, if it was).
+    /// Maximize `id`, as its maximize button would. Docked, it keeps its
+    /// spot to go back to; floating, where it was (before it was framed, if
+    /// it was).
     fn go_full(&mut self, id: WinId) {
         let back = self.framed_float.filter(|(f, _)| *f == id).map(|(_, r)| r).or_else(|| visual_rect(id));
         let Some(back) = back else { return };
@@ -1146,7 +1146,7 @@ impl App {
         self.leave_full();
         self.finish_anim();
         trace!("full screen {id:#x}");
-        enter_fullscreen(id, monitor_of_window(id));
+        maximize(id);
         self.full = Some((id, back));
         set_foreground(id);
         self.refresh_bars();
@@ -1157,8 +1157,8 @@ impl App {
     fn leave_full(&mut self) -> bool {
         let Some((id, back)) = self.full.take() else { return false };
         trace!("leave full screen {id:#x}");
-        end_fullscreen();
         if is_window(id) {
+            restore_if_maximized(id);
             match self.monitor_of(id) {
                 Some(m) => self.apply(m),
                 None => {
@@ -1170,12 +1170,11 @@ impl App {
         true
     }
 
-    /// `id` is going away, or being moved some other way: give it its
-    /// frame back, where it is.
+    /// `id` is going away, or being moved some other way: forget it was
+    /// full screen, leaving it as it is.
     fn drop_full(&mut self, id: WinId) {
         if self.is_full(id) {
             self.full = None;
-            end_fullscreen();
         }
     }
 
