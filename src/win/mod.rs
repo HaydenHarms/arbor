@@ -523,8 +523,9 @@ fn run_cmd(cmd: Cmd) {
             Cmd::Float if is_manageable(fg) || app.is_full(fg) => {
                 let full = app.is_full(fg);
                 if full {
-                    // Its frame back, where it is: it moves from there.
+                    // Un-maximized, it moves from where it was.
                     app.drop_full(fg);
+                    restore_if_maximized(fg);
                 }
                 let framed = app.framed_float.is_some_and(|(id, _)| id == fg);
                 app.forget_framed(fg);
