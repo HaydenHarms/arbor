@@ -202,9 +202,9 @@ struct App {
     /// A floating window framed to fill its display, and where it was, to
     /// put it back when you step out.
     framed_float: Option<(WinId, Rect)>,
-    /// The window full screen (Ctrl+Alt+Enter), and where it was if it
-    /// floats, to put it back.
-    full: Option<(WinId, Rect)>,
+    /// The windows full screen (Ctrl+Alt+Enter), at most one per display,
+    /// and where each was if it floats, to put it back.
+    full: Vec<(WinId, Rect)>,
     /// Tab strips in use, and hidden ones to reuse.
     bars: Vec<Bar>,
     spare_strips: Vec<Hwnd>,
@@ -436,9 +436,10 @@ fn wndproc(msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
                 match pick {
                     MENU_SHOW_ALL => run_cmd(Cmd::ShowAll),
                     MENU_OVERVIEW => with_app(|app| {
+                        let mon = monitor_at(cursor_pos());
                         app.unframe_float();
-                        app.leave_full();
-                        app.open_overview(monitor_at(cursor_pos()));
+                        app.leave_full_on(Some(mon));
+                        app.open_overview(mon);
                     }),
                     MENU_TEMPLATES => run_cmd(Cmd::Templates),
                     MENU_FLOAT_ALL => run_cmd(Cmd::FloatAll),
@@ -474,16 +475,16 @@ fn run_cmd(cmd: Cmd) {
         }
         // Already showing everything: step out once more, to the overview.
         let at_top = app.layouts.get(&mon).is_some_and(|l| l.camera.is_empty());
-        // Showing everything first puts a framed floating window, or a
-        // full-screen one, back.
-        let framed = matches!(cmd, Cmd::ShowAll) && (app.unframe_float() | app.leave_full());
+        // Showing everything first puts a framed floating window, or the
+        // full-screen one on this display, back.
+        let framed = matches!(cmd, Cmd::ShowAll) && (app.unframe_float() | app.leave_full_on(Some(mon)));
         // Most things done to a full-screen window put it back first.
         let keeps_full = matches!(
             cmd,
             Cmd::Frame | Cmd::Float | Cmd::PrevTab | Cmd::NextTab | Cmd::Keys | Cmd::Templates | Cmd::Unminimize
         );
         if app.is_full(fg) && !keeps_full {
-            app.leave_full();
+            app.leave_full(fg);
             app.finish_anim();
         }
         match cmd {
@@ -491,7 +492,7 @@ fn run_cmd(cmd: Cmd) {
             Cmd::ShowAll => app.camera(mon, |l| l.zoom_all()),
             Cmd::Frame => {
                 if app.is_full(fg) {
-                    app.leave_full();
+                    app.leave_full(fg);
                 } else if is_manageable(fg) {
                     app.go_full(fg);
                 }
@@ -742,9 +743,9 @@ impl App {
     /// Show tab `id` in its group, at once, and give it the focus. A group
     /// full screen stays full screen, whichever tab shows.
     fn select_tab(&mut self, id: WinId) {
-        let full = self.full.map(|(f, _)| f).filter(|&f| f != id && self.same_group(f, id));
-        if full.is_some() {
-            self.leave_full();
+        let full = self.full.iter().map(|&(f, _)| f).find(|&f| f != id && self.same_group(f, id));
+        if let Some(f) = full {
+            self.leave_full(f);
             self.finish_anim();
         }
         self.show_tab(id);
@@ -1133,7 +1134,7 @@ impl App {
     }
 
     fn is_full(&self, id: WinId) -> bool {
-        self.full.is_some_and(|(f, _)| f == id)
+        self.full.iter().any(|&(f, _)| f == id)
     }
 
     /// Maximize `id`, as its maximize button would. Docked, it keeps its
@@ -1147,23 +1148,44 @@ impl App {
     }
 
     /// Maximize `id`, putting it back at `back` if it floats when it
-    /// leaves full screen.
+    /// leaves full screen. Another window full screen on the same display
+    /// goes back first; those on other displays stay.
     fn go_full_from(&mut self, id: WinId, back: Rect) {
+        let mon = monitor_of_window(id);
         self.forget_framed(id);
-        self.unframe_float();
-        self.leave_full();
+        if self.framed_float.is_some_and(|(f, _)| monitor_of_window(f) == mon) {
+            self.unframe_float();
+        }
+        self.leave_full(id);
+        self.leave_full_on(Some(mon));
         self.finish_anim();
         trace!("full screen {id:#x}");
         maximize(id);
-        self.full = Some((id, back));
+        self.full.push((id, back));
         set_foreground(id);
         self.refresh_bars();
     }
 
-    /// Put the full-screen window back in its spot, or where it was. False
-    /// if none was full screen.
-    fn leave_full(&mut self) -> bool {
-        let Some((id, back)) = self.full.take() else { return false };
+    /// Put every full-screen window on display `mon` (any display, for
+    /// None) back. False if none was full screen there.
+    fn leave_full_on(&mut self, mon: Option<MonId>) -> bool {
+        let ids: Vec<WinId> = self
+            .full
+            .iter()
+            .map(|&(f, _)| f)
+            .filter(|&f| mon.is_none_or(|m| !is_window(f) || monitor_of_window(f) == m))
+            .collect();
+        for &id in &ids {
+            self.leave_full(id);
+        }
+        !ids.is_empty()
+    }
+
+    /// Put full-screen window `id` back in its spot, or where it was. False
+    /// if it wasn't full screen.
+    fn leave_full(&mut self, id: WinId) -> bool {
+        let Some(i) = self.full.iter().position(|&(f, _)| f == id) else { return false };
+        let (id, back) = self.full.remove(i);
         trace!("leave full screen {id:#x}");
         if is_window(id) {
             restore_if_maximized(id);
@@ -1181,9 +1203,7 @@ impl App {
     /// `id` is going away, or being moved some other way: forget it was
     /// full screen, leaving it as it is.
     fn drop_full(&mut self, id: WinId) {
-        if self.is_full(id) {
-            self.full = None;
-        }
+        self.full.retain(|&(f, _)| f != id);
     }
 
     /// The display a window being dragged would fill if dropped now.
@@ -1800,7 +1820,7 @@ impl App {
             self.end_overview(back);
         }
         self.unframe_float();
-        self.leave_full();
+        self.leave_full_on(None);
         self.finish_anim();
         let mon = self.template_display();
         let hints = t.shape.hints();
@@ -1903,7 +1923,7 @@ impl App {
     /// Release every window: back to a normal desktop, nothing lost.
     fn float_all(&mut self) {
         self.unframe_float();
-        self.leave_full();
+        self.leave_full_on(None);
         self.finish_anim();
         for (&m, l) in self.layouts.iter_mut() {
             l.zoom_all();
