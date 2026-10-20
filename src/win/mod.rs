@@ -1141,7 +1141,14 @@ impl App {
     /// it was).
     fn go_full(&mut self, id: WinId) {
         let back = self.framed_float.filter(|(f, _)| *f == id).map(|(_, r)| r).or_else(|| visual_rect(id));
-        let Some(back) = back else { return };
+        if let Some(back) = back {
+            self.go_full_from(id, back);
+        }
+    }
+
+    /// Maximize `id`, putting it back at `back` if it floats when it
+    /// leaves full screen.
+    fn go_full_from(&mut self, id: WinId, back: Rect) {
         self.forget_framed(id);
         self.unframe_float();
         self.leave_full();
@@ -1225,7 +1232,7 @@ impl App {
         let zone = if resizing {
             None
         } else if let Some(mon) = self.fullscreen_target(hwnd, pt) {
-            Some(framed_rect(mon))
+            Some(work_area(mon))
         } else if let Some(t) = self.tab_target(hwnd, pt) {
             match t {
                 TabOnto::Docked(mon, onto) => self.layouts[&mon].slot(onto, work_area(mon)),
@@ -1305,21 +1312,16 @@ impl App {
             return;
         }
 
-        // Dropped on the middle of the top: fill the display. A docked
-        // window is framed where it sits; any other floats framed, and
-        // stepping out puts it back where the drag began.
+        // Dropped on the middle of the top: full screen, as Ctrl+Alt+Enter.
+        // A docked window keeps its spot to go back to; any other floats,
+        // and goes back to where the drag began.
         if let Some(mon) = self.fullscreen_target(hwnd, pt) {
             trace!("drop fullscreen on {mon:#x}");
-            match docked_on {
-                Some(m) if m == mon => self.camera(m, |l| l.frame(hwnd)),
-                _ => {
-                    if let Some(m) = docked_on {
-                        self.undock(hwnd);
-                        self.apply(m);
-                    }
-                    self.frame_float(hwnd, mon, start);
-                }
+            if let Some(m) = docked_on.filter(|&m| m != mon) {
+                self.undock(hwnd);
+                self.apply(m);
             }
+            self.go_full_from(hwnd, start);
             return;
         }
 

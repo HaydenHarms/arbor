@@ -24,7 +24,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 - While you drag, a frosted panel shows exactly where the window will land. No panel means it will float where you drop it.
 - Drag a window by its title bar until the pointer meets a screen edge to dock it there. The first window takes that half of the screen; the next fills the other half.
 - Near either end of an edge, it stacks instead: top or bottom of the right edge puts it above or below what's docked on the right, and the ends of the top or bottom edge put it beside what's docked there.
-- Push a window against the middle of the top edge to fill the screen with it. A docked window is framed where it sits; a floating one comes back to where you picked it up when you show everything again (`Ctrl+Alt+Space`).
+- Push a window against the middle of the top edge to make it full screen, as `Ctrl+Alt+Enter` does: it maximizes. A docked window goes back to its spot when it leaves full screen; a floating one comes back to where you picked it up.
 - Drop it near the edge of a docked window to split that window's space.
 - Drop it on another window's title bar to make them tabs, or hold Shift and drop it anywhere on the window. That works on docked and floating windows alike. They share that spot under a strip of tabs, and only the picked one shows; a floating group moves with its window. Drop more windows on the strip to add tabs.
 - Drop it in the middle of the screen or of any window and it floats. Drop a docked window there to float it again.
