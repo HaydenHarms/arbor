@@ -975,10 +975,10 @@ impl App {
     }
 
     /// The window a window being dragged would join as a tab if dropped
-    /// now: the one whose title bar or strip of tabs the pointer is on, or
-    /// with Shift held, any window under the pointer.
+    /// now: with Shift held, the one under the pointer, or whose strip of
+    /// tabs it is on. Without Shift, it never joins one.
     fn tab_target(&self, hwnd: Hwnd, pt: (i32, i32)) -> Option<TabOnto> {
-        if !is_manageable(hwnd) {
+        if !shift_down() || !is_manageable(hwnd) {
             return None;
         }
         let onto = |w: WinId| match self.monitor_of(w) {
@@ -995,18 +995,12 @@ impl App {
         // A floating window on top there.
         let under = window_under(pt, hwnd);
         if under != 0 && self.monitor_of(under).is_none() {
-            let r = visual_rect(under)?;
-            let zone = (TITLE_ZONE as f32 * monitor_scale(monitor_at(pt))).round() as i32;
-            return (shift_down() || pt.1 < r.y + zone).then_some(TabOnto::Floating(under));
+            return Some(TabOnto::Floating(under));
         }
         // A docked one.
         let mon = monitor_at(pt);
         let (l, area) = (self.layouts.get(&mon)?, work_area(mon));
-        let w = if shift_down() {
-            l.window_at(area, pt.0, pt.1, hwnd)?
-        } else {
-            l.tab_target(area, pt.0, pt.1, hwnd)?
-        };
+        let w = l.window_at(area, pt.0, pt.1, hwnd)?;
         Some(TabOnto::Docked(mon, w))
     }
 
@@ -1345,7 +1339,7 @@ impl App {
             return;
         }
 
-        // Dropped on a docked window's title bar, or a strip of tabs: join
+        // Dropped with Shift held on a window, or its strip of tabs: join
         // that window's spot as a tab.
         if let Some(t) = self.tab_target(hwnd, pt) {
             trace!("drop as tab on {t:?}");

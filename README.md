@@ -26,7 +26,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 - Near either end of an edge, it stacks instead: top or bottom of the right edge puts it above or below what's docked on the right, and the ends of the top or bottom edge put it beside what's docked there.
 - Push a window against the middle of the top edge to make it full screen, as `Ctrl+Alt+Enter` does: it maximizes. A docked window goes back to its spot when it leaves full screen; a floating one comes back to where you picked it up.
 - Drop it near the edge of a docked window to split that window's space.
-- Drop it on another window's title bar to make them tabs, or hold Shift and drop it anywhere on the window. That works on docked and floating windows alike. They share that spot under a strip of tabs, and only the picked one shows; a floating group moves with its window. Drop more windows on the strip to add tabs.
+- Hold Shift and drop it on another window to make them tabs; without Shift, windows never join as tabs. That works on docked and floating windows alike. They share that spot under a strip of tabs, and only the picked one shows; a floating group moves with its window. Shift-drop more windows on the window or its strip to add tabs.
 - Drop it in the middle of the screen or of any window and it floats. Drop a docked window there to float it again.
 - Maximized windows drag too: grab the title bar and the window restores under the pointer, as it does with Windows Snap on.
 - Drag the border between two docked windows to resize both at once.
@@ -35,7 +35,7 @@ Lattice lives in the system tray. Right-click the icon to show everything, open 
 **Tabs**
 
 - Click a tab to show that window. Middle-click a tab to close its window.
-- Drag a tab off the strip to take it out of the group, then drop it anywhere as usual: an edge docks it, the middle floats it, another title bar makes it a tab there.
+- Drag a tab off the strip to take it out of the group, then drop it anywhere as usual: an edge docks it, the middle floats it, with Shift held, another window makes it a tab there.
 - Drag the showing window by its own title bar, or the strip anywhere off its tabs, to move the whole group: to an edge to dock it there, or to the middle to float it.
 - Tabs work with any app, because Lattice only moves windows. It never puts one app's window inside another's.
 - Switching to a hidden tab with Alt+Tab or the taskbar shows it. The same goes for any docked window zoomed out of view: Lattice steps out until it's in view.
