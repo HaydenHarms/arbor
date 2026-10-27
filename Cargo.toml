@@ -3,7 +3,7 @@ name = "lattice"
 version = "1.2.8"
 edition = "2021"
 description = "A nesting, zooming tiling window manager for Windows"
-license = "MIT"
+license = "MPL-2.0"
 
 [[bin]]
 name = "lattice"
