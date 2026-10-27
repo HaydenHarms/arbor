@@ -103,4 +103,4 @@ cargo test   # layout engine tests, runs on any OS
 
 ## License
 
-MIT
+[MPL-2.0](LICENSE)
